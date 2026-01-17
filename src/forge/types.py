@@ -38,6 +38,7 @@ class Observation:
 class Launcher(Enum):
     MAST = "mast"
     SLURM = "slurm"
+    SKYPILOT = "skypilot"
 
 
 @dataclass
@@ -115,6 +116,14 @@ class LauncherConfig:
         None  # Memory per node (SLURM param, can get with sinfo)
     )
     gpus_per_node: int = 8  # GPUs per node (SLURM param, can get with sinfo)
+
+    # SkyPilot-specific configuration
+    cloud: str | None = None  # Cloud provider: kubernetes, aws, gcp, azure, etc.
+    accelerator: str | None = None  # GPU accelerator spec, e.g., "H100:8", "A100:4"
+    region: str | None = None  # Cloud region or Kubernetes context
+    idle_minutes_to_autostop: int | None = 30  # Auto-cleanup idle clusters
+    skypilot_image_id: str | None = None  # Custom Docker image for SkyPilot workers
+    model_name: str | None = None  # HuggingFace model name to pre-download on workers
 
     def __post_init__(self):
         if isinstance(self.launcher, str):

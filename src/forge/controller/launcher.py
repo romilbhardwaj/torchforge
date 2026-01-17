@@ -113,6 +113,135 @@ class Slurmlauncher(BaseLauncher):
         return
 
 
+class SkyPilotLauncher(BaseLauncher):
+    """Launcher for running TorchForge on Kubernetes and cloud VMs via SkyPilot.
+
+    This launcher provisions cloud instances or Kubernetes pods using SkyPilot,
+    then runs Monarch workers on each node. The driver must be running inside
+    the Kubernetes cluster for K8s backends.
+
+    Example config:
+        provisioner:
+          launcher: skypilot
+          cloud: kubernetes
+          accelerator: "H100:8"
+          job_name: my_grpo_job
+          idle_minutes_to_autostop: 30
+    """
+
+    def __init__(self, cfg: LauncherConfig):
+        self.cfg = cfg
+
+    async def initialize(self) -> tuple[JobTrait, JobState]:
+        """Initialize the SkyPilot launcher and provision cloud resources.
+
+        Returns:
+            A tuple of (job, job_state) containing the SkyPilotJob handle and its state.
+        """
+        # Import SkyPilotJob here to avoid import errors when SkyPilot is not installed
+        try:
+            from forge.controller.skypilot_job import SkyPilotJob
+        except ImportError as err:
+            raise ImportError(
+                "SkyPilot is not installed. Install it with: "
+                "pip install skypilot[kubernetes]"
+            ) from err
+
+        try:
+            import sky
+        except ImportError as err:
+            raise ImportError(
+                "SkyPilot is not installed. Install it with: "
+                "pip install skypilot[kubernetes]"
+            ) from err
+
+        # Collect all mesh requirements from config
+        meshes = get_meshes_from_config(self.cfg)
+
+        # If no remote resources needed, skip job creation
+        if not meshes:
+            return None, None
+
+        # Build SkyPilot resources from config
+        resources_kwargs = {}
+
+        # Set cloud provider
+        if self.cfg.cloud:
+            cloud_map = {
+                "kubernetes": sky.Kubernetes,
+                "aws": sky.AWS,
+                "gcp": sky.GCP,
+                "azure": sky.Azure,
+            }
+            cloud_cls = cloud_map.get(self.cfg.cloud.lower())
+            if cloud_cls:
+                resources_kwargs["cloud"] = cloud_cls()
+            else:
+                logger.warning(
+                    f"Unknown cloud '{self.cfg.cloud}', letting SkyPilot choose"
+                )
+
+        # Set accelerator (e.g., "H100:8")
+        if self.cfg.accelerator:
+            resources_kwargs["accelerators"] = self.cfg.accelerator
+
+        # Set region if specified
+        if self.cfg.region:
+            resources_kwargs["region"] = self.cfg.region
+
+        # Set custom image if specified
+        if self.cfg.skypilot_image_id:
+            resources_kwargs["image_id"] = self.cfg.skypilot_image_id
+
+        resources = sky.Resources(**resources_kwargs) if resources_kwargs else None
+
+        # Create SkyPilotJob
+        logger.info(f"Creating SkyPilotJob with meshes: {meshes}")
+        # Find TorchForge project root (contains pyproject.toml)
+        import forge
+        import pathlib
+
+        forge_root = pathlib.Path(forge.__file__).parent.parent.parent
+        workdir = str(forge_root) if (forge_root / "pyproject.toml").exists() else None
+
+        # Prepare environment variables for workers
+        worker_envs = {}
+        if self.cfg.model_name:
+            worker_envs["MODEL_NAME"] = self.cfg.model_name
+            logger.info(f"Setting MODEL_NAME env var for workers: {self.cfg.model_name}")
+        else:
+            logger.warning("model_name not set in config, workers won't pre-download model")
+
+        job = SkyPilotJob(
+            meshes=meshes,
+            resources=resources,
+            cluster_name=self.cfg.job_name + "_workers" if self.cfg.job_name else None,
+            idle_minutes_to_autostop=self.cfg.idle_minutes_to_autostop,
+            down_on_autostop=True,
+            workdir=workdir,  # Sync TorchForge to workers for actor serialization
+            envs=worker_envs if worker_envs else None,
+        )
+
+        # Apply the job to allocate resources
+        logger.info("Launching SkyPilot cluster...")
+        job.apply()
+
+        # Register cleanup handler
+        atexit.register(job.kill)
+
+        # Wait for job allocation and get state
+        logger.info(
+            "Getting job state (this will block until pods/VMs are provisioned)..."
+        )
+        job_state = job.state(cached_path=None)
+
+        logger.info("SkyPilotLauncher initialization complete.")
+        return job, job_state
+
+    async def remote_setup(self, procs: ProcMesh) -> None:
+        return
+
+
 def get_launcher(cfg: LauncherConfig | None = None) -> BaseLauncher | None:
     if not cfg:
         return None
@@ -125,6 +254,14 @@ def get_launcher(cfg: LauncherConfig | None = None) -> BaseLauncher | None:
             return MastLauncher(cfg, detached=False)
         except ImportError as err:
             raise ValueError("MAST is not available, cannot launch MAST jobs.") from err
-
+    elif cfg.launcher == Launcher.SKYPILOT:
+        try:
+            # SkyPilot import is handled inside SkyPilotLauncher.initialize()
+            return SkyPilotLauncher(cfg)
+        except ImportError as err:
+            raise ValueError(
+                "SkyPilot is not installed. Install it with: "
+                "pip install skypilot[kubernetes]"
+            ) from err
     else:
         raise ValueError(f"Unsupported config provided, got {cfg}")

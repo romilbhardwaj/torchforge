@@ -6,11 +6,14 @@
 
 import argparse
 import functools
+import logging
 import sys
 from argparse import Namespace
 from typing import Any, Callable
 
 from huggingface_hub import snapshot_download
+
+logger = logging.getLogger(__name__)
 from huggingface_hub.utils import LocalEntryNotFoundError
 
 from omegaconf import DictConfig, OmegaConf
@@ -233,6 +236,48 @@ def resolve_hf_hub_paths(cfg: DictConfig) -> DictConfig:
     return OmegaConf.create(resolved_dict)
 
 
+def strip_hf_prefixes(cfg: DictConfig) -> DictConfig:
+    """
+    Strips 'hf://' prefixes from configuration values without downloading.
+
+    This is used for distributed setups (like SkyPilot) where each worker
+    should download models themselves rather than using the driver's cache.
+    The stripped paths (e.g., 'Qwen/Qwen3-8B') can be used directly with
+    HuggingFace Hub functions.
+
+    Args:
+        cfg (DictConfig): OmegaConf DictConfig containing configuration values.
+
+    Returns:
+        DictConfig: OmegaConf DictConfig with 'hf://' prefixes stripped.
+    """
+    if cfg is None:
+        raise ValueError("Input config cannot be None")
+
+    if not OmegaConf.is_config(cfg):
+        raise ValueError(f"Input must be an OmegaConf config object, got {type(cfg)}")
+
+    def _recursively_strip_prefixes(obj: Any) -> Any:
+        """Recursively strip hf:// prefixes from nested data structures."""
+        if isinstance(obj, str) and obj.startswith("hf://"):
+            return obj.replace("hf://", "", 1)
+        elif isinstance(obj, dict):
+            return {k: _recursively_strip_prefixes(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_recursively_strip_prefixes(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(_recursively_strip_prefixes(item) for item in obj)
+        elif isinstance(obj, DictConfig):
+            return _recursively_strip_prefixes(OmegaConf.to_container(obj, resolve=True))
+        else:
+            return obj
+
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    stripped_dict = _recursively_strip_prefixes(cfg_dict)
+
+    return OmegaConf.create(stripped_dict)
+
+
 class ForgeRecipeArgParser(argparse.ArgumentParser):
     """
     A helpful utility subclass of the ``argparse.ArgumentParser`` that
@@ -311,7 +356,18 @@ def parse(recipe_main: Any) -> Callable[..., Any]:
         # Get user-specified args from config and CLI and create params for recipe
         yaml_args, cli_args = parser.parse_known_args()
         conf = _merge_yaml_and_cli_args(yaml_args, cli_args)
-        conf = resolve_hf_hub_paths(conf)
+
+        # For SkyPilot launcher, strip hf:// prefix instead of resolving to local paths
+        # Workers will download models themselves using the plain HF repo names
+        launcher = OmegaConf.select(conf, "provisioner.launcher", default=None)
+        if launcher != "skypilot":
+            conf = resolve_hf_hub_paths(conf)
+        else:
+            logger.info(
+                "Using deferred HF path resolution for SkyPilot launcher - "
+                "workers will download models themselves"
+            )
+            conf = strip_hf_prefixes(conf)
 
         sys.exit(recipe_main(conf))
 

@@ -1,0 +1,173 @@
+# Grouped Relative Policy Optimization (GRPO) on Kubernetes via SkyPilot
+#
+# This config is used by the driver pod to run GRPO training.
+# The driver pod is launched using torchforge_grpo.sky.yaml.
+#
+# Usage:
+#   # From your laptop:
+#   sky launch torchforge_grpo.sky.yaml -c forge-grpo
+#
+# The driver will use this config to provision worker pods via SkyPilot.
+
+# Global configuration
+group_size: 16
+local_batch_size: 4  # per-device batch size
+max_req_tokens: 1024
+max_res_tokens: 2048
+model: "Qwen/Qwen3-8B"
+off_by_n: 1  # Off by one by default
+compile: true  # Enable torch.compile for trainer/ref_model, and CUDA graphs for vLLM
+
+# SkyPilot provisioner configuration
+provisioner:
+  launcher: skypilot
+  cloud: kubernetes  # or aws, gcp, azure, etc.
+  accelerator: "H200:1"  # GPU spec per worker node
+  job_name: forge_grpo_qwen3_8b
+  idle_minutes_to_autostop: 30  # Auto-cleanup after 30 min idle
+  model_name: ${model}  # Model to pre-download on workers
+
+# Observability configuration
+# Note: wandb disabled for testing - enable with WANDB_API_KEY env var
+metric_logging:
+  # wandb:
+  #   entity: torchforge
+  #   project: grpo-skypilot
+  #   group: grpo_skypilot_exp
+  #   logging_mode: global_reduce
+  console:
+    logging_mode: global_reduce
+
+# Dataset configuration
+dataset:
+  path: "openai/gsm8k"
+  revision: "main"
+  data_split: "train"
+  streaming: true
+  model: ${model}
+
+# Generator configuration
+generator:
+  engine_args:
+    model: ${model}
+    tensor_parallel_size: 1  # Set to 1 to match H200:1 per node
+    pipeline_parallel_size: 1
+    enforce_eager: ${not:${compile}}
+  sampling_params:
+    n: ${group_size}
+    max_tokens: ${max_res_tokens}
+    temperature: 1.0
+    top_p: 1.0
+
+# Trainer configuration
+trainer:
+  model:
+    name: qwen3
+    flavor: 8B
+    hf_assets_path: hf://${model}
+  optimizer:
+    name: AdamW
+    lr: 1e-5
+    eps: 1e-8
+  lr_scheduler:
+    warmup_steps: 1
+  training:
+    local_batch_size: ${local_batch_size}
+    seq_len: ${sum:${max_req_tokens},${max_res_tokens}}
+    max_norm: 1.0
+    steps: 1000000
+    dtype: bfloat16
+    gc_freq: 1
+  compile:
+    enable: ${compile}
+  parallelism:
+    data_parallel_replicate_degree: 1
+    data_parallel_shard_degree: -1
+    tensor_parallel_degree: 1
+    pipeline_parallel_degree: 1
+    context_parallel_degree: 1
+    expert_parallel_degree: 1
+    disable_loss_parallel: true
+  checkpoint:
+    enable: true
+    folder: ./checkpoint
+    initial_load_path: hf://${model}
+    initial_load_in_hf: true
+    last_save_in_hf: true
+    interval: 500
+    async_mode: "disabled"
+  activation_checkpoint:
+    mode: selective
+    selective_ac_option: op
+  comm:
+    init_timeout_seconds: 1800
+
+# Replay buffer configuration
+replay_buffer:
+  batch_size: ${local_batch_size}
+  max_policy_age: ${off_by_n}
+  dp_size: 2
+
+# Reference model configuration
+ref_model:
+  model:
+    name: qwen3
+    flavor: 8B
+    hf_assets_path: hf://${model}
+  training:
+    seq_len: ${trainer.training.seq_len}
+    dtype: bfloat16
+    gc_freq: 1
+  compile:
+    enable: ${compile}
+  parallelism:
+    data_parallel_replicate_degree: 1
+    data_parallel_shard_degree: 1
+    tensor_parallel_degree: 1
+    pipeline_parallel_degree: 1
+    context_parallel_degree: 1
+    expert_parallel_degree: 1
+  checkpoint:
+    initial_load_path: hf://${model}
+    initial_load_in_hf: true
+  comm:
+    init_timeout_seconds: 1800
+
+# All resource allocations (with remote hosts via SkyPilot)
+services:
+  generator:
+    procs: ${generator.engine_args.tensor_parallel_size}
+    num_replicas: 1
+    hosts: 1
+    with_gpus: true
+    mesh_name: generator
+  ref_model:
+    procs: 1
+    num_replicas: 1
+    hosts: 1
+    with_gpus: true
+    mesh_name: ref_model
+  reward_actor:
+    procs: 1
+    num_replicas: 1
+    with_gpus: false
+    mesh_name: reward_actor
+
+actors:
+  dataset:
+    procs: 1
+    with_gpus: false
+    mesh_name: dataset
+  trainer:
+    procs: 1
+    hosts: 1
+    with_gpus: true
+    mesh_name: trainer
+  replay_buffer:
+    procs: 1
+    with_gpus: false
+    mesh_name: replay_buffer
+  compute_advantages:
+    procs: 1
+    with_gpus: false
+    mesh_name: compute_advantages

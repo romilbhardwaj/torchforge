@@ -1,0 +1,100 @@
+# SkyPilot task YAML for running TorchForge GRPO on Kubernetes.
+#
+# This YAML launches a driver pod that runs the GRPO training controller.
+# The driver pod then uses SkyPilot to provision worker pods for GPU workloads.
+#
+# Usage:
+#   # From your laptop (outside the cluster):
+#   cd torchforge/experimental/skypilot
+#   sky launch torchforge_grpo.sky.yaml -c forge-grpo
+#
+#   # With custom configuration:
+#   sky launch torchforge_grpo.sky.yaml -c forge-grpo \
+#     --env ACCELERATOR="A100:4" \
+#     --env CONFIG=qwen3_8b.yaml
+#
+# To view logs:
+#   sky logs forge-grpo
+#
+# To SSH into the driver:
+#   sky ssh forge-grpo
+#
+# To tear down:
+#   sky down forge-grpo
+
+name: torchforge-grpo
+
+resources:
+  cloud: kubernetes  # Driver pod runs on Kubernetes
+  cpus: 4+
+  memory: 16+
+  image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+
+# Environment variables for configuration
+# Override with: sky launch ... --env CONFIG=my_config.yaml
+envs:
+  CONFIG: qwen3_8b.yaml  # TorchForge GRPO config file
+  ACCELERATOR: "H100:8"  # GPU spec for worker pods (passed to config)
+
+# Sync the TorchForge repository to the cluster
+workdir: ../..
+
+setup: |
+  set -ex
+  
+  echo "=== Installing system dependencies ==="
+  apt-get update && apt-get install -y socat curl git
+  
+  # Install kubectl for Kubernetes cluster management
+  echo "=== Installing kubectl ==="
+  curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+  chmod +x kubectl
+  mv kubectl /usr/local/bin/
+  kubectl version --client || echo "kubectl installed"
+  
+  echo "=== Installing TorchForge and dependencies ==="
+  cd ~/sky_workdir
+  
+  # Install TorchForge in editable mode
+  uv pip install --system -e ".[dev]"
+  
+  # Pin transformers to 4.x (5.0rc has breaking changes with vllm)
+  uv pip install --system "transformers>=4.50,<5.0"
+  
+  # Install SkyPilot with Kubernetes support for launching nested clusters
+  uv pip install --system "skypilot[kubernetes]"
+  
+  # Verify installations
+  python -c "import forge; print(f'TorchForge installed successfully')"
+  python -c "import monarch; print(f'Monarch installed: {monarch}')"
+  python -c "import sky; print(f'SkyPilot installed: {sky}')"
+  
+  # Configure SkyPilot to use in-cluster Kubernetes context
+  unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
+  sky api start
+  
+  # Verify Kubernetes access
+  echo "=== Verifying Kubernetes access ==="
+  sky check kubernetes
+  
+  echo "=== Available GPUs ==="
+  sky show-gpus --infra kubernetes || echo "Could not list GPUs"
+  
+  echo "=== Setup complete ==="
+
+run: |
+  set -ex
+  
+  echo "=== Running TorchForge GRPO with SkyPilot ==="
+  echo "Config: $CONFIG"
+  echo "Accelerator: $ACCELERATOR"
+  
+  cd ~/sky_workdir
+  
+  # Set USER env var (not set in container by default, but used by some configs)
+  export USER=$(whoami)
+  
+  # Run the GRPO training script with the specified config
+  python -m apps.grpo.main --config experimental/skypilot/$CONFIG
+  
+  echo "=== Training completed ==="

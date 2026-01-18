@@ -1,0 +1,47 @@
+# SkyPilot ignore file - exclude large files from workdir sync
+# See: https://docs.skypilot.co/en/latest/examples/syncing-code-artifacts.html
+
+# Git directory (very large, not needed on remote)
+/.git
+
+# Python cache and build artifacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+/.eggs
+/*.egg-info
+/build
+/dist
+
+# Virtual environments
+/.venv
+/venv
+/.conda
+
+# IDE and editor files
+/.idea
+/.vscode
+*.swp
+*.swo
+
+# Test and coverage artifacts
+/.pytest_cache
+/.coverage
+/htmlcov
+/.tox
+
+# Checkpoints and model files (large)
+*.pt
+*.pth
+*.bin
+*.safetensors
+/checkpoint
+
+# Logs
+*.log
+/logs
+
+# OS files
+.DS_Store
+Thumbs.db

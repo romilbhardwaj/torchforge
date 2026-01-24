@@ -11,6 +11,8 @@ The SkyPilot integration allows TorchForge to provision and manage distributed t
 
 ### Architecture
 
+The integration uses **SkyPilot JobGroups** to launch heterogeneous resources - each mesh (generator, trainer, ref_model) is a separate Task with its own resource requirements.
+
 ```mermaid
 flowchart LR
     subgraph Local["🖥️ Local Machine"]
@@ -24,14 +26,15 @@ flowchart LR
             Launcher["SkyPilotLauncher"]
         end
 
-        subgraph Workers["Worker Pods (SkyPilot)"]
-            Generator["Generator<br/>(vLLM)"]
-            Trainer["Trainer<br/>(TorchTitan)"]
-            RefModel["RefModel"]
+        subgraph JobGroup["SkyPilot JobGroup"]
+            Generator["Task: generator<br/>(H100:2, 64GB)"]
+            Trainer["Task: trainer<br/>(H100:1)"]
+            RefModel["Task: ref_model<br/>(H100:1)"]
         end
     end
 
     Laptop -->|"sky launch"| Driver
+    Launcher -->|"jobs.launch"| JobGroup
     Launcher <-->|"TCP:22222"| Generator
     Launcher <-->|"TCP:22222"| Trainer
     Launcher <-->|"TCP:22222"| RefModel
@@ -40,22 +43,25 @@ flowchart LR
 **How it works:**
 1. You run `sky launch` from your laptop to start the driver pod
 2. The driver runs `apps.grpo.main` with `launcher: skypilot` in the config
-3. `SkyPilotLauncher` provisions GPU worker pods via SkyPilot
-4. Workers install TorchForge and download HuggingFace models during setup
-5. The driver connects to Monarch workers over TCP (port 22222)
-6. Actors (Generator, Trainer, RefModel) are spawned on worker pods
+3. `SkyPilotLauncher` creates a **JobGroup** with separate Tasks for each mesh
+4. Each Task can have different resources (GPU types, CPU, memory)
+5. Workers install TorchForge and download HuggingFace models during setup
+6. The driver connects to Monarch workers over TCP (port 22222)
+7. Actors (Generator, Trainer, RefModel) are spawned on their respective Task pods
 
 ## Quickstart
 
 ### Prerequisites
 
-1. **Install SkyPilot** on your local machine:
+1. **Install SkyPilot nightly** on your local machine:
+
+> **Note**: The JobGroups feature requires `skypilot-nightly`, not the stable release.
 
 ```bash
-pip install skypilot[kubernetes]  # For Kubernetes
-pip install skypilot[aws]         # For AWS
-pip install skypilot[gcp]         # For GCP
-pip install skypilot[all]         # For all clouds
+pip install skypilot-nightly[kubernetes]  # For Kubernetes
+pip install skypilot-nightly[aws]         # For AWS
+pip install skypilot-nightly[gcp]         # For GCP
+pip install skypilot-nightly[all]         # For all clouds
 ```
 
 2. **Verify SkyPilot setup**:
@@ -80,23 +86,9 @@ This will:
 1. Launch a driver pod in your Kubernetes cluster
 2. Install TorchForge and dependencies on the driver
 3. Start the GRPO training loop
-4. Provision worker pods for Generator, Trainer, and RefModel
-5. Install TorchForge and download models on workers
+4. Launch a **JobGroup** with separate Tasks for Generator, Trainer, and RefModel
+5. Each Task installs TorchForge and downloads models
 6. Begin training with metrics logging
-
-### Customizing the Configuration
-
-Override environment variables to customize the run:
-
-```bash
-# Use different GPU types
-sky launch torchforge_grpo.sky.yaml -c forge-grpo \
-  --env ACCELERATOR="A100:4"
-
-# Use a different config file
-sky launch torchforge_grpo.sky.yaml -c forge-grpo \
-  --env CONFIG=my_custom_config.yaml
-```
 
 ### Monitoring and Debugging
 
@@ -107,38 +99,73 @@ sky logs forge-grpo
 # SSH into the driver pod
 ssh forge-grpo
 
-# Check worker pod status (run from driver pod)
-ssh forge-grpo "sky status"
+# View JobGroup status (from driver pod)
+ssh forge-grpo "sky jobs queue"
 
-# View worker logs (run from driver pod before teardown)
-ssh forge-grpo "sky logs <worker-cluster-name>"
+# View worker logs
+ssh forge-grpo "sky jobs logs <job_id>"
 ```
 
 ### Cleanup
 
 ```bash
-# Tear down the driver and all worker pods
+# Tear down the driver (workers are cleaned up automatically via JobGroup)
 sky down forge-grpo
 
-# Remove all clusters
-sky down --all
+# Or cancel just the JobGroup workers
+ssh forge-grpo "sky jobs cancel <job_id>"
 ```
 
 ## Configuration Reference
 
-### TorchForge Config (qwen3_8b.yaml)
+### SkyPilot Args (skypilot_args)
 
-The key section for SkyPilot is the `provisioner` block:
+The SkyPilot integration is configured via the `skypilot_args` dictionary in the provisioner section. This is similar to `slurm_args` for Slurm.
 
 ```yaml
 provisioner:
   launcher: skypilot
-  cloud: kubernetes      # Cloud provider: kubernetes, aws, gcp, azure
-  accelerator: "H100:8"  # GPU spec per worker node
-  job_name: my_grpo_job  # Cluster name prefix
-  idle_minutes_to_autostop: 30  # Auto-cleanup after idle
-  model_name: Qwen/Qwen3-8B     # HuggingFace model to pre-download on workers
+  job_name: my_grpo_job
+  skypilot_args:
+    # Cloud configuration
+    cloud: kubernetes      # Cloud provider: kubernetes, aws, gcp, azure
+    image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+    idle_minutes_to_autostop: 30
+    model_name: Qwen/Qwen3-8B  # HuggingFace model to pre-download
+
+    # Default resources for all meshes
+    default_mesh_resources:
+      accelerators: "H100:1"  # GPU spec
+      cpus: "4+"              # Minimum CPUs
+      memory: "32+"           # Minimum memory (GB)
+
+    # Per-mesh resource overrides (merged with defaults)
+    mesh_resources:
+      generator:
+        accelerators: "H100:2"  # Generator needs more GPUs
+        memory: "64+"
+      trainer:
+        accelerators: "H100:1"
+      ref_model:
+        accelerators: "H100:1"
+      # CPU-only meshes can override accelerators to null
+      # replay_buffer:
+      #   accelerators: null
+      #   cpus: "8+"
 ```
+
+### Resource Specification
+
+Resources are specified per-mesh and merged with defaults:
+
+| Key | Type | Description | Example |
+|-----|------|-------------|---------|
+| `accelerators` | str | GPU type and count | `"H100:2"`, `"A100:4"` |
+| `cpus` | str | CPU requirement | `"4+"`, `"8"` |
+| `memory` | str | Memory in GB | `"32+"`, `"64"` |
+| `image_id` | str | Docker image (per-mesh override) | `"docker:my-image:tag"` |
+
+**Resolution order**: `mesh_resources[mesh_name]` → `default_mesh_resources` → SkyPilot defaults
 
 ### Model Pre-download
 
@@ -172,9 +199,45 @@ actors:
     mesh_name: trainer
 ```
 
-**GPU Assignment**: Each actor/service with `with_gpus: true` gets `procs` GPUs assigned. The `accelerator` config (e.g., `H100:1`) specifies how many GPUs are available per worker node. Ensure `procs` ≤ GPUs per node.
+**GPU Assignment**: Each actor/service with `with_gpus: true` gets `procs` GPUs assigned. The `accelerators` config (e.g., `H100:1`) specifies how many GPUs are available per worker node. Ensure `procs` ≤ GPUs per node.
 
 Services/actors without `hosts` or with `hosts: 0` run locally on the driver pod.
+
+## Heterogeneous Resources Example
+
+The power of JobGroups is running different GPU types and CPU-only workers:
+
+```yaml
+provisioner:
+  launcher: skypilot
+  job_name: heterogeneous_example
+  skypilot_args:
+    cloud: aws
+    model_name: Qwen/Qwen3-8B
+    
+    default_mesh_resources:
+      cpus: "4+"
+      memory: "16+"
+    
+    mesh_resources:
+      # GPU workers with different GPU types
+      generator:
+        accelerators: "A100:2"
+        memory: "128+"
+      trainer:
+        accelerators: "H100:1"
+      ref_model:
+        accelerators: "A10G:1"  # Cheaper GPU for reference model
+      
+      # CPU-only workers (no accelerators)
+      replay_buffer:
+        accelerators: null
+        cpus: "16+"
+        memory: "256+"
+      reward_actor:
+        accelerators: null
+        cpus: "8+"
+```
 
 ## Supported Clouds
 
@@ -224,7 +287,7 @@ This significantly speeds up the workdir sync, especially if your `.git` directo
 For faster cold starts, consider using a custom Docker image with pre-installed dependencies:
 
 ```yaml
-resources:
+skypilot_args:
   image_id: docker:your-registry/torchforge-base:latest
 ```
 
@@ -239,24 +302,18 @@ sky show-gpus --infra kubernetes
 
 ### View Worker Logs
 
-Worker pods are torn down when the driver fails. To debug worker issues, **SSH into the driver quickly** before teardown:
+Worker pods are managed by the JobGroup. To view logs:
 
 ```bash
-# From your laptop, SSH into driver
-ssh forge-grpo
+# From your laptop
+ssh forge-grpo  # SSH into driver
 
-# From driver, view worker logs
-sky logs <worker-cluster-name> 1  # Job 1 logs
+# From driver, view JobGroup status
+sky jobs queue
 
-# Check installed vllm version
-ssh <worker-cluster-name> "python -c 'import vllm; print(vllm.__version__)'"
-```
-
-### SSH into Workers
-
-```bash
-# From driver pod
-ssh <worker-cluster-name>
+# View logs for a specific job
+sky jobs logs <job_id>
+sky jobs logs <job_id> --controller  # Controller logs
 ```
 
 ### Common Issues
@@ -264,12 +321,12 @@ ssh <worker-cluster-name>
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | `ModuleNotFoundError: No module named 'vllm.executor'` | Wrong vllm version on workers | Ensure workers install TorchForge using `uv pip install -e .` (respects pyproject.toml index sources) |
-| `checkpoint.initial_load_path is not valid` | Model not downloaded on workers | Add `model_name` to provisioner config |
+| `checkpoint.initial_load_path is not valid` | Model not downloaded on workers | Add `model_name` to `skypilot_args` |
 | `SkyPilot is not installed` | Missing SkyPilot on driver | Check `torchforge_grpo.sky.yaml` setup script installs `skypilot[kubernetes]` |
 | Connection timeout | Network issues | Ensure driver and workers are in the same cluster/VPC; check port 22222 is open |
 | GPU not available | Scheduling issues | Check `sky show-gpus --infra kubernetes` for available GPUs |
 | Pod scheduling issues | Resource constraints | Check Kubernetes node resources, taints, and tolerations |
-| `Timeout spawning proc mesh` | Mismatch between requested procs and available GPUs | Ensure `procs` ≤ `accelerator` GPU count (e.g., `procs: 1` with `H200:1`) |
+| `Timeout spawning proc mesh` | Mismatch between requested procs and available GPUs | Ensure `procs` ≤ `accelerators` GPU count (e.g., `procs: 1` with `H100:1`) |
 | Slow workdir sync | Large .git directory | Add `.skyignore` with `.git/` |
 | `torchmonarch` serialization error | Version mismatch | Ensure workers install the exact same `torchmonarch-nightly` version as driver |
 
@@ -281,15 +338,16 @@ ssh <worker-cluster-name>
    sky logs forge-grpo -f  # Follow logs
    ```
 
-2. **If training fails, SSH quickly**:
+2. **If training fails, check JobGroup**:
    ```bash
    ssh forge-grpo
-   sky status  # Note worker cluster name
-   sky logs <worker-cluster-name> 1  # View worker setup/run logs
+   sky jobs queue  # Find job ID
+   sky jobs logs <job_id>  # View task logs
    ```
 
 3. **Check versions on workers**:
    ```bash
+   # Get worker cluster name from jobs queue output
    ssh <worker-cluster-name>
    python -c "import vllm; print(vllm.__version__)"
    python -c "import monarch; print(monarch.__version__)"
@@ -316,11 +374,15 @@ ssh <worker-cluster-name>
 The SkyPilot integration is implemented in:
 
 - `src/forge/controller/launcher.py`: `SkyPilotLauncher` class that interfaces with SkyPilot
-- `src/forge/controller/skypilot_job.py`: `SkyPilotJob` Monarch JobTrait for provisioning workers
-- `src/forge/types.py`: `LauncherConfig` with SkyPilot-specific fields
+- `src/forge/controller/skypilot_job.py`: `SkyPilotJob` Monarch JobTrait using JobGroups
+- `src/forge/types.py`: `LauncherConfig` with `skypilot_args` dict
 - `src/forge/util/config.py`: Logic to strip `hf://` prefixes for SkyPilot
 
-The worker setup script in `skypilot_job.py`:
+The `SkyPilotJob` creates a **multi-document YAML** for the JobGroup:
+- First document: JobGroup header with `execution: parallel`
+- Subsequent documents: One Task per mesh with its resources
+
+Worker setup script in `skypilot_job.py`:
 1. Installs git and system dependencies
 2. Installs TorchForge with all dependencies via `uv pip install -e .`
 3. Pins `torchmonarch-nightly` and `transformers` versions

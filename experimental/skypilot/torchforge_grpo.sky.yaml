@@ -1,7 +1,17 @@
 # SkyPilot task YAML for running TorchForge GRPO on Kubernetes.
 #
 # This YAML launches a driver pod that runs the GRPO training controller.
-# The driver pod then uses SkyPilot to provision worker pods for GPU workloads.
+# The driver pod then uses SkyPilot JobGroups to provision worker pods:
+#   - Each mesh (generator, trainer, ref_model) is launched as a separate Task
+#   - Each Task can have different resource requirements (GPUs, CPUs, memory)
+#   - All Tasks run in parallel and communicate via TCP
+#
+# Architecture:
+#   [Your Laptop] --> sky launch --> [Driver Pod (this task)]
+#                                         |
+#                                         +--> JobGroup Task: generator (H100:1)
+#                                         +--> JobGroup Task: trainer (H100:1)
+#                                         +--> JobGroup Task: ref_model (H100:1)
 #
 # Usage:
 #   # From your laptop (outside the cluster):
@@ -10,14 +20,17 @@
 #
 #   # With custom configuration:
 #   sky launch torchforge_grpo.sky.yaml -c forge-grpo \
-#     --env ACCELERATOR="A100:4" \
 #     --env CONFIG=qwen3_8b.yaml
 #
 # To view logs:
 #   sky logs forge-grpo
 #
+# To view worker logs:
+#   sky jobs queue  # Find job ID
+#   sky jobs logs <job_id>
+#
 # To SSH into the driver:
-#   sky ssh forge-grpo
+#   ssh forge-grpo
 #
 # To tear down:
 #   sky down forge-grpo
@@ -34,7 +47,6 @@ resources:
 # Override with: sky launch ... --env CONFIG=my_config.yaml
 envs:
   CONFIG: qwen3_8b.yaml  # TorchForge GRPO config file
-  ACCELERATOR: "H100:8"  # GPU spec for worker pods (passed to config)
 
 # Sync the TorchForge repository to the cluster
 workdir: ../..
@@ -61,16 +73,35 @@ setup: |
   # Pin transformers to 4.x (5.0rc has breaking changes with vllm)
   uv pip install --system "transformers>=4.50,<5.0"
   
-  # Install SkyPilot with Kubernetes support for launching nested clusters
-  uv pip install --system "skypilot[kubernetes]"
+  # Install SkyPilot from source (master branch) for JobGroups support
+  # NOTE: JobGroups is a new feature not yet in stable releases
+  echo "=== Installing SkyPilot from source ==="
+  cd ~
+  git clone https://github.com/skypilot-org/skypilot.git
+  cd skypilot
+  uv pip install --system -e ".[kubernetes]"
+  cd ~/sky_workdir
   
   # Verify installations
   python -c "import forge; print(f'TorchForge installed successfully')"
   python -c "import monarch; print(f'Monarch installed: {monarch}')"
-  python -c "import sky; print(f'SkyPilot installed: {sky}')"
+  python -c "import sky; print(f'SkyPilot installed: {sky.__version__}')"
+  
+  # Configure SkyPilot for jobs consolidation mode (runs jobs controller locally)
+  echo "=== Configuring SkyPilot ==="
+  mkdir -p ~/.sky
+  echo "jobs:" > ~/.sky/config.yaml
+  echo "  controller:" >> ~/.sky/config.yaml
+  echo "    consolidation_mode: true" >> ~/.sky/config.yaml
+  echo "  force_disable_cloud_bucket: true" >> ~/.sky/config.yaml
+  echo "SkyPilot config:"
+  cat ~/.sky/config.yaml
   
   # Configure SkyPilot to use in-cluster Kubernetes context
   unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
+  
+  # Stop any existing API server and start fresh (to pick up config)
+  sky api stop || true
   sky api start
   
   # Verify Kubernetes access
@@ -85,9 +116,8 @@ setup: |
 run: |
   set -ex
   
-  echo "=== Running TorchForge GRPO with SkyPilot ==="
+  echo "=== Running TorchForge GRPO with SkyPilot JobGroups ==="
   echo "Config: $CONFIG"
-  echo "Accelerator: $ACCELERATOR"
   
   cd ~/sky_workdir
   
@@ -95,6 +125,7 @@ run: |
   export USER=$(whoami)
   
   # Run the GRPO training script with the specified config
+  # This will launch a JobGroup with separate Tasks for each mesh
   python -m apps.grpo.main --config experimental/skypilot/$CONFIG
   
   echo "=== Training completed ==="

@@ -117,13 +117,19 @@ class LauncherConfig:
     )
     gpus_per_node: int = 8  # GPUs per node (SLURM param, can get with sinfo)
 
-    # SkyPilot-specific configuration
-    cloud: str | None = None  # Cloud provider: kubernetes, aws, gcp, azure, etc.
-    accelerator: str | None = None  # GPU accelerator spec, e.g., "H100:8", "A100:4"
-    region: str | None = None  # Cloud region or Kubernetes context
-    idle_minutes_to_autostop: int | None = 30  # Auto-cleanup idle clusters
-    skypilot_image_id: str | None = None  # Custom Docker image for SkyPilot workers
-    model_name: str | None = None  # HuggingFace model name to pre-download on workers
+    # SkyPilot-specific configuration (all settings in one dict, similar to slurm_args)
+    # Expected keys:
+    #   cloud: str - kubernetes, aws, gcp, azure
+    #   region: str - cloud region or k8s context
+    #   idle_minutes_to_autostop: int - auto-cleanup timeout
+    #   image_id: str - Docker image
+    #   model_name: str - HuggingFace model to pre-download
+    #   default_mesh_resources: dict - default resources for all meshes
+    #     - accelerators: str - e.g., "H100:1"
+    #     - cpus: str - e.g., "4+"
+    #     - memory: str - e.g., "32+"
+    #   mesh_resources: dict[str, dict] - per-mesh resource overrides
+    skypilot_args: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if isinstance(self.launcher, str):

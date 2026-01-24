@@ -116,17 +116,32 @@ class Slurmlauncher(BaseLauncher):
 class SkyPilotLauncher(BaseLauncher):
     """Launcher for running TorchForge on Kubernetes and cloud VMs via SkyPilot.
 
-    This launcher provisions cloud instances or Kubernetes pods using SkyPilot,
-    then runs Monarch workers on each node. The driver must be running inside
-    the Kubernetes cluster for K8s backends.
+    This launcher provisions cloud instances or Kubernetes pods using SkyPilot
+    JobGroups, allowing heterogeneous resources per mesh. Each mesh (generator,
+    trainer, replay_buffer, etc.) is launched as a separate Task with its own
+    resource requirements.
+
+    The driver must be running inside the Kubernetes cluster for K8s backends.
 
     Example config:
         provisioner:
           launcher: skypilot
-          cloud: kubernetes
-          accelerator: "H100:8"
           job_name: my_grpo_job
-          idle_minutes_to_autostop: 30
+          skypilot_args:
+            cloud: kubernetes
+            image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+            idle_minutes_to_autostop: 30
+            model_name: Qwen/Qwen3-8B
+            default_mesh_resources:
+              accelerators: "H100:1"
+              cpus: "4+"
+              memory: "32+"
+            mesh_resources:
+              generator:
+                accelerators: "H100:2"
+              replay_buffer:
+                accelerators: null
+                cpus: "8+"
     """
 
     def __init__(self, cfg: LauncherConfig):
@@ -147,14 +162,6 @@ class SkyPilotLauncher(BaseLauncher):
                 "pip install skypilot[kubernetes]"
             ) from err
 
-        try:
-            import sky
-        except ImportError as err:
-            raise ImportError(
-                "SkyPilot is not installed. Install it with: "
-                "pip install skypilot[kubernetes]"
-            ) from err
-
         # Collect all mesh requirements from config
         meshes = get_meshes_from_config(self.cfg)
 
@@ -162,68 +169,51 @@ class SkyPilotLauncher(BaseLauncher):
         if not meshes:
             return None, None
 
-        # Build SkyPilot resources from config
-        resources_kwargs = {}
+        # Parse skypilot_args
+        skypilot_args = self.cfg.skypilot_args or {}
 
-        # Set cloud provider
-        if self.cfg.cloud:
-            cloud_map = {
-                "kubernetes": sky.Kubernetes,
-                "aws": sky.AWS,
-                "gcp": sky.GCP,
-                "azure": sky.Azure,
-            }
-            cloud_cls = cloud_map.get(self.cfg.cloud.lower())
-            if cloud_cls:
-                resources_kwargs["cloud"] = cloud_cls()
-            else:
-                logger.warning(
-                    f"Unknown cloud '{self.cfg.cloud}', letting SkyPilot choose"
-                )
+        cloud = skypilot_args.get("cloud")
+        image_id = skypilot_args.get("image_id")
+        idle_minutes_to_autostop = skypilot_args.get("idle_minutes_to_autostop", 30)
+        model_name = skypilot_args.get("model_name")
+        default_mesh_resources = skypilot_args.get("default_mesh_resources", {})
+        mesh_resources = skypilot_args.get("mesh_resources", {})
 
-        # Set accelerator (e.g., "H100:8")
-        if self.cfg.accelerator:
-            resources_kwargs["accelerators"] = self.cfg.accelerator
-
-        # Set region if specified
-        if self.cfg.region:
-            resources_kwargs["region"] = self.cfg.region
-
-        # Set custom image if specified
-        if self.cfg.skypilot_image_id:
-            resources_kwargs["image_id"] = self.cfg.skypilot_image_id
-
-        resources = sky.Resources(**resources_kwargs) if resources_kwargs else None
-
-        # Create SkyPilotJob
+        # Create SkyPilotJob with JobGroups support
         logger.info(f"Creating SkyPilotJob with meshes: {meshes}")
+        logger.info(f"Default mesh resources: {default_mesh_resources}")
+        logger.info(f"Per-mesh resources: {mesh_resources}")
+
         # Find TorchForge project root (contains pyproject.toml)
-        import forge
         import pathlib
+
+        import forge
 
         forge_root = pathlib.Path(forge.__file__).parent.parent.parent
         workdir = str(forge_root) if (forge_root / "pyproject.toml").exists() else None
 
         # Prepare environment variables for workers
         worker_envs = {}
-        if self.cfg.model_name:
-            worker_envs["MODEL_NAME"] = self.cfg.model_name
-            logger.info(f"Setting MODEL_NAME env var for workers: {self.cfg.model_name}")
+        if model_name:
+            worker_envs["MODEL_NAME"] = model_name
+            logger.info(f"Setting MODEL_NAME env var for workers: {model_name}")
         else:
-            logger.warning("model_name not set in config, workers won't pre-download model")
+            logger.warning("model_name not set in skypilot_args, workers won't pre-download model")
 
         job = SkyPilotJob(
             meshes=meshes,
-            resources=resources,
+            default_mesh_resources=default_mesh_resources,
+            mesh_resources=mesh_resources,
+            cloud=cloud,
+            image_id=image_id,
             cluster_name=self.cfg.job_name + "_workers" if self.cfg.job_name else None,
-            idle_minutes_to_autostop=self.cfg.idle_minutes_to_autostop,
-            down_on_autostop=True,
+            idle_minutes_to_autostop=idle_minutes_to_autostop,
             workdir=workdir,  # Sync TorchForge to workers for actor serialization
             envs=worker_envs if worker_envs else None,
         )
 
         # Apply the job to allocate resources
-        logger.info("Launching SkyPilot cluster...")
+        logger.info("Launching SkyPilot JobGroup...")
         job.apply()
 
         # Register cleanup handler

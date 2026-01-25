@@ -56,6 +56,12 @@ except ImportError:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+
+def _sanitize_dns_name(name: str) -> str:
+    """Sanitize a name to be DNS-compatible (replace underscores with hyphens)."""
+    return name.replace("_", "-")
+
+
 # Default port for Monarch TCP communication
 MONARCH_WORKER_PORT = 22222
 
@@ -307,8 +313,8 @@ except Exception as e:
         """Create a multi-document YAML string for the JobGroup."""
         import yaml
 
-        # Header document
-        job_group_name = self._cluster_name or f"forge-{os.getpid()}"
+        # Header document - sanitize for DNS compatibility
+        job_group_name = _sanitize_dns_name(self._cluster_name or f"forge-{os.getpid()}")
         header = {"name": job_group_name, "execution": "parallel"}
 
         # Use provided setup commands or default
@@ -342,8 +348,10 @@ except Exception as e:
             if resources.image_id:
                 res_dict["image_id"] = resources.image_id
 
+            # Sanitize mesh name for DNS compatibility
+            dns_safe_name = _sanitize_dns_name(mesh_name)
             task_doc = {
-                "name": mesh_name,
+                "name": dns_safe_name,
                 "resources": res_dict,
                 "num_nodes": num_nodes,
                 "setup": setup,
@@ -454,7 +462,8 @@ except Exception as e:
         """Wait for all tasks in the JobGroup to reach RUNNING status."""
         start_time = time.time()
         poll_interval = 15  # seconds
-        expected_tasks = set(self._meshes.keys())
+        # Use sanitized names to match what we created in the YAML
+        expected_tasks = set(_sanitize_dns_name(name) for name in self._meshes.keys())
 
         logger.info(
             f"Waiting for JobGroup tasks to start (timeout={timeout}s)..."
@@ -462,9 +471,10 @@ except Exception as e:
 
         while time.time() - start_time < timeout:
             try:
-                # Query job status
+                # Query job status - use refresh=False to avoid issues with
+                # consolidation mode (no remote jobs controller exists)
                 request_id = sky_jobs.queue(
-                    refresh=True, job_ids=[self._job_id]
+                    refresh=False, job_ids=[self._job_id]
                 )
                 jobs = sky.get(request_id)
 
@@ -524,30 +534,51 @@ except Exception as e:
         return f"{cluster_name}-{job_id}"
 
     def _get_mesh_ips(self, mesh_name: str) -> list[str]:
-        """Get IP addresses (hostnames) for a specific mesh's cluster.
+        """Get IP addresses for a specific mesh's cluster.
         
-        For JobGroups on Kubernetes, we use DNS hostnames that are 
-        resolvable within the JobGroup's network namespace.
-        Format: {task_name}-{node_idx}.{job_group_name}
+        Uses SkyPilot's cluster handle to get the actual pod/VM IPs.
+        These IPs are routable from the driver pod to the worker pods.
         """
-        num_nodes = self._meshes[mesh_name]
-        job_group_name = self._cluster_name  # The cluster_name is our job group name
+        # Sanitize mesh name for DNS compatibility (matching what we used in YAML)
+        dns_safe_name = _sanitize_dns_name(mesh_name)
+        # Generate cluster name using SkyPilot's naming convention
+        cluster_name = self._generate_cluster_name(dns_safe_name, self._job_id)
+        logger.info(f"Looking for cluster '{cluster_name}' for mesh '{mesh_name}'")
 
-        # For K8s JobGroups, use DNS hostnames instead of looking up IPs
-        # The hostnames are resolvable via K8s DNS within the JobGroup
-        hostnames = []
-        for node_idx in range(num_nodes):
-            # JobGroup hostname format: {task_name}-{node_idx}.{job_group_name}
-            hostname = f"{mesh_name}-{node_idx}.{job_group_name}"
-            hostnames.append(hostname)
+        # Get handle from cluster name
+        handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+        if handle is None:
+            raise RuntimeError(
+                f"No handle found for cluster '{cluster_name}'. "
+                f"Cluster may not be fully initialized yet."
+            )
 
-        logger.info(f"Mesh '{mesh_name}' hostnames: {hostnames}")
-        return hostnames
+        if handle.stable_internal_external_ips is None:
+            raise RuntimeError(f"Cluster '{cluster_name}' has no IP information")
+
+        # Extract IPs - prefer internal for K8s, external for cloud
+        ips = []
+        for internal_ip, external_ip in handle.stable_internal_external_ips:
+            # For K8s, use internal IP (pod IP)
+            ip = internal_ip if internal_ip else external_ip
+            if ip:
+                ips.append(ip)
+
+        logger.info(f"Mesh '{mesh_name}' IPs: {ips}")
+        return ips
 
     def _state(self) -> JobState:
         """Get the current state with HostMesh objects for each mesh."""
+        logger.info("Getting job state (this will block until pods/VMs are provisioned)...")
+        
         if not self._jobs_active():
-            raise RuntimeError("SkyPilot JobGroup is not active")
+            # This can happen if the API server doesn't track jobs properly
+            # in consolidation mode, but the pods may still be running
+            logger.warning(
+                "Job status check returned not active, but will try to get IPs anyway"
+            )
+        else:
+            logger.info("Job is running, returning current state")
 
         # Get IPs for each mesh
         host_meshes = {}
@@ -600,7 +631,12 @@ except Exception as e:
         )
 
     def _jobs_active(self) -> bool:
-        """Check if the SkyPilot JobGroup is still active."""
+        """Check if the SkyPilot JobGroup is still active.
+        
+        In consolidation mode, the jobs controller runs locally and the API
+        may have issues tracking job state. We're lenient here because the
+        actual pods may be running even if the API doesn't report them.
+        """
         if not self.active or self._job_id is None:
             return False
 
@@ -616,15 +652,27 @@ except Exception as e:
                 if "RUNNING" in status:
                     return True
 
-            return False
+            # If we got results but none are running, jobs may have completed/failed
+            if jobs:
+                return False
+            
+            # Empty result - could be API issue, assume jobs are still active
+            logger.debug(f"Empty job queue result for job {self._job_id}, assuming active")
+            return True
+
         except Exception as e:
-            error_msg = str(e)
-            # In consolidation mode, the jobs controller doesn't exist
-            # If we get this error, the job might still be running - check another way
-            if "does not exist" in error_msg and "controller" in error_msg.lower():
+            error_msg = str(e).lower()
+            # Known errors where jobs might still be running:
+            # - "does not exist" + "controller" - consolidation mode issue
+            # - "no in-progress managed jobs" - API server not tracking jobs
+            # In both cases, the pods may still be running
+            if any(pattern in error_msg for pattern in [
+                "does not exist",
+                "no in-progress managed jobs",
+                "clusternotuperror",
+            ]):
                 logger.debug(
-                    f"Jobs controller not found (consolidation mode?), "
-                    f"assuming job {self._job_id} is still active"
+                    f"Job status check failed ({e}), assuming job {self._job_id} is still active"
                 )
                 return True
             logger.warning(f"Error checking job status: {e}")

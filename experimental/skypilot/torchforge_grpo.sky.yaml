@@ -73,15 +73,6 @@ setup: |
   # Pin transformers to 4.x (5.0rc has breaking changes with vllm)
   uv pip install --system "transformers>=4.50,<5.0"
   
-    
-  # Configure SkyPilot (WITHOUT consolidation mode to test JobGroups)
-  echo "=== Configuring SkyPilot ==="
-  mkdir -p ~/.sky
-  echo "jobs:" > ~/.sky/config.yaml
-  echo "  force_disable_cloud_bucket: true" >> ~/.sky/config.yaml
-  echo "SkyPilot config:"
-  cat ~/.sky/config.yaml
-  
   # Install SkyPilot from source (master branch) for JobGroups support
   # NOTE: JobGroups is a new feature not yet in stable releases
   echo "=== Installing SkyPilot from source ==="
@@ -96,6 +87,16 @@ setup: |
   python -c "import monarch; print(f'Monarch installed: {monarch}')"
   python -c "import sky; print(f'SkyPilot installed: {sky.__version__}')"
   
+  # Configure SkyPilot for jobs consolidation mode (runs jobs controller locally)
+  echo "=== Configuring SkyPilot ==="
+  mkdir -p ~/.sky
+  echo "jobs:" > ~/.sky/config.yaml
+  echo "  controller:" >> ~/.sky/config.yaml
+  echo "    consolidation_mode: true" >> ~/.sky/config.yaml
+  echo "  force_disable_cloud_bucket: true" >> ~/.sky/config.yaml
+  echo "SkyPilot config:"
+  cat ~/.sky/config.yaml
+  
   # Configure SkyPilot to use in-cluster Kubernetes context
   unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
   
@@ -105,12 +106,10 @@ setup: |
   sky api start
   sleep 10  # Wait for server to fully start with new config
   
-  # Verify consolidation mode is active (run a dummy query to check)
-  echo "=== Verifying SkyPilot API server is ready ==="
+  # Verify consolidation mode is active
+  echo "=== Verifying consolidation mode ==="
   sky api status
-  
-  # Run jobs queue to confirm no consolidation warning
-  sky jobs queue || echo "Jobs queue check failed (expected if no jobs)"
+  sky jobs queue || echo "No jobs yet"
   
   # Verify Kubernetes access
   echo "=== Verifying Kubernetes access ==="
@@ -132,14 +131,8 @@ run: |
   # Set USER env var (not set in container by default, but used by some configs)
   export USER=$(whoami)
   
-  # Set Monarch/Hyperactor timeouts (important for remote connections)
-  export HYPERACTOR_HOST_SPAWN_READY_TIMEOUT=900s
-  export HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT=900s
-  export HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE=900s
-  
-  # Verify API server is ready (do NOT restart here - it kills the jobs controller!)
-  echo "=== Verifying API server state ==="
-  sky api status
+  # Ensure SkyPilot uses the correct Kubernetes context
+  unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
   
   # Run the GRPO training script with the specified config
   # This will launch a JobGroup with separate Tasks for each mesh

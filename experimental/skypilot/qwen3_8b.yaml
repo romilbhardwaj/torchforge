@@ -23,7 +23,7 @@ compile: true  # Enable torch.compile for trainer/ref_model, and CUDA graphs for
 # SkyPilot provisioner configuration using JobGroups
 provisioner:
   launcher: skypilot
-  job_name: forge_grpo_qwen3_8b
+  job_name: forge-grpo-qwen3-8b
   skypilot_args:
     # Cloud configuration
     cloud: kubernetes
@@ -43,7 +43,7 @@ provisioner:
         accelerators: "H100:1"
         memory: "64+"
       trainer:
-        accelerators: "H100:2"
+        accelerators: "H100:1"
       ref_model:
         accelerators: "H100:1"
 
@@ -172,15 +172,14 @@ services:
   reward_actor:
     procs: 1
     num_replicas: 1
-    hosts: 1
     with_gpus: false
-    mesh_name: reward_actor
+    mesh_name: ref_model  # Share mesh with ref_model (CPU-only service)
 
 actors:
   dataset:
     procs: 1
     with_gpus: false
-    mesh_name: dataset
+    mesh_name: generator  # Share mesh with generator
   trainer:
     procs: 1
     hosts: 1
@@ -189,8 +188,8 @@ actors:
   replay_buffer:
     procs: 1
     with_gpus: false
-    mesh_name: replay_buffer
+    mesh_name: trainer  # Share mesh with trainer
   compute_advantages:
     procs: 1
     with_gpus: false
-    mesh_name: compute_advantages
+    mesh_name: trainer  # Share mesh with trainer

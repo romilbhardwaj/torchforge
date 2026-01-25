@@ -7,7 +7,9 @@
 #   # From your laptop:
 #   sky launch torchforge_grpo.sky.yaml -c forge-grpo
 #
-# The driver will use this config to provision worker pods via SkyPilot.
+# The driver will use this config to provision worker pods via SkyPilot JobGroups.
+# Each mesh (generator, trainer, ref_model) is launched as a separate SkyPilot Task
+# with its own resource requirements, enabling heterogeneous GPU/CPU allocation.
 
 # Global configuration
 group_size: 16
@@ -18,14 +20,32 @@ model: "Qwen/Qwen3-8B"
 off_by_n: 1  # Off by one by default
 compile: true  # Enable torch.compile for trainer/ref_model, and CUDA graphs for vLLM
 
-# SkyPilot provisioner configuration
+# SkyPilot provisioner configuration using JobGroups
 provisioner:
   launcher: skypilot
-  cloud: kubernetes  # or aws, gcp, azure, etc.
-  accelerator: "H200:1"  # GPU spec per worker node
   job_name: forge_grpo_qwen3_8b
-  idle_minutes_to_autostop: 30  # Auto-cleanup after 30 min idle
-  model_name: ${model}  # Model to pre-download on workers
+  skypilot_args:
+    # Cloud configuration
+    cloud: kubernetes
+    image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+    idle_minutes_to_autostop: 30
+    model_name: ${model}  # Model to pre-download on workers
+
+    # Default resources for meshes without explicit overrides
+    default_mesh_resources:
+      cpus: "4+"
+      memory: "32+"
+
+    # Per-mesh resource overrides (merged with defaults)
+    # GPU meshes get H100s, CPU-only meshes override to remove accelerators
+    mesh_resources:
+      generator:
+        accelerators: "H100:1"
+        memory: "64+"
+      trainer:
+        accelerators: "H100:2"
+      ref_model:
+        accelerators: "H100:1"
 
 # Observability configuration
 # Note: wandb disabled for testing - enable with WANDB_API_KEY env var
@@ -50,7 +70,7 @@ dataset:
 generator:
   engine_args:
     model: ${model}
-    tensor_parallel_size: 1  # Set to 1 to match H200:1 per node
+    tensor_parallel_size: 1  # Set to 1 to match H100:1 per node
     pipeline_parallel_size: 1
     enforce_eager: ${not:${compile}}
   sampling_params:
@@ -133,7 +153,9 @@ ref_model:
   comm:
     init_timeout_seconds: 1800
 
-# All resource allocations (with remote hosts via SkyPilot)
+# All resource allocations (with remote hosts via SkyPilot JobGroups)
+# Note: Only meshes with hosts > 0 will be launched as separate SkyPilot Tasks
+# Meshes without hosts run locally on the driver pod
 services:
   generator:
     procs: ${generator.engine_args.tensor_parallel_size}
@@ -150,6 +172,7 @@ services:
   reward_actor:
     procs: 1
     num_replicas: 1
+    hosts: 1
     with_gpus: false
     mesh_name: reward_actor
 

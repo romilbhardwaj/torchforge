@@ -134,6 +134,12 @@ run: |
   # Ensure SkyPilot uses the correct Kubernetes context
   unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
   
+  # Set Hyperactor/Monarch timeouts for proc mesh spawn and message delivery
+  # These are needed on the driver to allow time for workers to start
+  export HYPERACTOR_HOST_SPAWN_READY_TIMEOUT=900s
+  export HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT=900s
+  export HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE=900s
+  
   # Run the GRPO training script with the specified config
   # This will launch a JobGroup with separate Tasks for each mesh
   python -m apps.grpo.main --config experimental/skypilot/$CONFIG

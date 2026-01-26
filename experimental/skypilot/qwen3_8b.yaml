@@ -40,10 +40,10 @@ provisioner:
     # GPU meshes get H100s, CPU-only meshes override to remove accelerators
     mesh_resources:
       generator:
-        accelerators: "H100:1"
+        accelerators: "H100:2"
         memory: "64+"
       trainer:
-        accelerators: "H100:1"
+        accelerators: "H100:2"
       ref_model:
         accelerators: "H100:1"
 
@@ -70,7 +70,7 @@ dataset:
 generator:
   engine_args:
     model: ${model}
-    tensor_parallel_size: 1  # Set to 1 to match H100:1 per node
+    tensor_parallel_size: 2  # Set to 2 to match H100:2 per node
     pipeline_parallel_size: 1
     enforce_eager: ${not:${compile}}
   sampling_params:
@@ -172,6 +172,7 @@ services:
   reward_actor:
     procs: 1
     num_replicas: 1
+    hosts: 1
     with_gpus: false
     mesh_name: reward_actor
 

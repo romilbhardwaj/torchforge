@@ -77,27 +77,44 @@ DEFAULT_MONARCH_VERSION = "2025.12.17"
 # Key dependency versions - must match driver environment
 # vllm comes from the forge preview index (specified in pyproject.toml [tool.uv.sources])
 # We use uv to install TorchForge WITH deps so it respects the uv.sources configuration
+#
+# NOTE: These setup commands are smart about detecting pre-installed dependencies.
+# With the pre-built romilb/torchforge:latest image, most steps are skipped.
+# With the base pytorch image, full installation is performed.
 DEFAULT_SETUP_COMMANDS = f"""
 set -ex
 
-# Install git (required for pip installing packages with git dependencies)
-apt-get update && apt-get install -y git
+# Check if TorchForge and dependencies are already installed (pre-built image)
+DEPS_INSTALLED=false
+if python -c "import forge; import monarch; import vllm" 2>/dev/null; then
+    echo "TorchForge, Monarch, and vLLM already installed (using pre-built image)"
+    DEPS_INSTALLED=true
+    python -c "import forge; import monarch; import vllm; print(f'forge OK, monarch OK, vllm={{vllm.__version__}}')"
+fi
 
-# Install TorchForge WITH all dependencies using uv (respects pyproject.toml [tool.uv.sources])
-# This ensures vllm comes from the correct index (preview/forge)
-if [ -f ~/sky_workdir/pyproject.toml ]; then
-    echo "Installing TorchForge and all dependencies from synced workdir..."
-    cd ~/sky_workdir
+# Install dependencies if not already present
+if [ "$DEPS_INSTALLED" = "false" ]; then
+    echo "Dependencies not found, installing from scratch..."
     
-    # Install TorchForge with all deps - uv will use [tool.uv.sources] to get vllm from forge index
-    uv pip install --system -e .
+    # Install git (required for pip installing packages with git dependencies)
+    apt-get update && apt-get install -y git
     
-    # Verify vllm version
-    python -c "import vllm; print(f'Installed vllm version: {{vllm.__version__}}')"
-    
-    # Pin specific versions that must match driver
-    uv pip install --system "torchmonarch-nightly=={DEFAULT_MONARCH_VERSION}"
-    uv pip install --system "transformers>=4.50,<5.0"
+    # Install TorchForge WITH all dependencies using uv (respects pyproject.toml [tool.uv.sources])
+    # This ensures vllm comes from the correct index (preview/forge)
+    if [ -f ~/sky_workdir/pyproject.toml ]; then
+        echo "Installing TorchForge and all dependencies from synced workdir..."
+        cd ~/sky_workdir
+        
+        # Install TorchForge with all deps - uv will use [tool.uv.sources] to get vllm from forge index
+        uv pip install --system -e .
+        
+        # Verify vllm version
+        python -c "import vllm; print(f'Installed vllm version: {{vllm.__version__}}')"
+        
+        # Pin specific versions that must match driver
+        uv pip install --system "torchmonarch-nightly=={DEFAULT_MONARCH_VERSION}"
+        uv pip install --system "transformers>=4.50,<5.0"
+    fi
 fi
 
 # Pre-download HuggingFace models if MODEL_NAME env var is set
@@ -115,9 +132,12 @@ else
     echo "MODEL_NAME is not set, skipping model download"
 fi
 
-echo "Done installing dependencies for TorchForge workers"
+echo "Done with TorchForge worker setup"
 """
-DEFAULT_IMAGE_ID = "docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime"
+# Pre-built TorchForge image with all dependencies installed
+# This dramatically speeds up worker initialization (minutes instead of 10+ minutes)
+# To rebuild: see experimental/skypilot/docker-builder.sky.yaml
+DEFAULT_IMAGE_ID = "docker:romilb/torchforge:latest"
 
 
 def _configure_transport() -> None:

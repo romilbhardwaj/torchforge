@@ -41,7 +41,9 @@ resources:
   cloud: kubernetes  # Driver pod runs on Kubernetes
   cpus: 4+
   memory: 16+
-  image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+  # Pre-built TorchForge image with all dependencies
+  # Rebuild with: experimental/skypilot/docker-builder.sky.yaml
+  image_id: docker:romilb/torchforge:latest
 
 # Environment variables for configuration
 # Override with: sky launch ... --env CONFIG=my_config.yaml
@@ -54,40 +56,55 @@ workdir: ../..
 setup: |
   set -ex
   
-  echo "=== Installing system dependencies ==="
-  apt-get update && apt-get install -y socat curl git
+  # Check if TorchForge, Monarch, and SkyPilot are already installed (pre-built image)
+  DEPS_INSTALLED=false
+  if python -c "import forge; import monarch; import sky" 2>/dev/null; then
+    echo "=== TorchForge, Monarch, and SkyPilot already installed (using pre-built image) ==="
+    DEPS_INSTALLED=true
+    python -c "import forge; import monarch; import sky; print(f'forge OK, monarch OK, sky={sky.__version__}')"
+  fi
   
-  # Install kubectl for Kubernetes cluster management
-  echo "=== Installing kubectl ==="
-  curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-  chmod +x kubectl
-  mv kubectl /usr/local/bin/
+  # Install system dependencies (always needed for kubectl)
+  echo "=== Installing system dependencies ==="
+  if ! command -v kubectl &> /dev/null; then
+    apt-get update && apt-get install -y socat curl git
+    
+    # Install kubectl for Kubernetes cluster management
+    echo "=== Installing kubectl ==="
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    chmod +x kubectl
+    mv kubectl /usr/local/bin/
+  fi
   kubectl version --client || echo "kubectl installed"
   
-  echo "=== Installing TorchForge and dependencies ==="
-  cd ~/sky_workdir
-  
-  # Install TorchForge in editable mode
-  uv pip install --system -e ".[dev]"
-  
-  # Pin transformers to 4.x (5.0rc has breaking changes with vllm)
-  uv pip install --system "transformers>=4.50,<5.0"
-  
-  # Install SkyPilot from source (master branch) for JobGroups support
-  # NOTE: JobGroups is a new feature not yet in stable releases
-  echo "=== Installing SkyPilot from source ==="
-  cd ~
-  git clone https://github.com/skypilot-org/skypilot.git
-  cd skypilot
-  uv pip install --system -e ".[kubernetes]"
-  cd ~/sky_workdir
-  
-  # Verify installations
-  python -c "import forge; print(f'TorchForge installed successfully')"
-  python -c "import monarch; print(f'Monarch installed: {monarch}')"
-  python -c "import sky; print(f'SkyPilot installed: {sky.__version__}')"
+  # Install dependencies if not already present
+  if [ "$DEPS_INSTALLED" = "false" ]; then
+    echo "=== Installing TorchForge and dependencies ==="
+    cd ~/sky_workdir
+    
+    # Install TorchForge in editable mode
+    uv pip install --system -e ".[dev]"
+    
+    # Pin transformers to 4.x (5.0rc has breaking changes with vllm)
+    uv pip install --system "transformers>=4.50,<5.0"
+    
+    # Install SkyPilot from source (master branch) for JobGroups support
+    # NOTE: JobGroups is a new feature not yet in stable releases
+    echo "=== Installing SkyPilot from source ==="
+    cd ~
+    git clone https://github.com/skypilot-org/skypilot.git
+    cd skypilot
+    uv pip install --system -e ".[kubernetes]"
+    cd ~/sky_workdir
+    
+    # Verify installations
+    python -c "import forge; print(f'TorchForge installed successfully')"
+    python -c "import monarch; print(f'Monarch installed: {monarch}')"
+    python -c "import sky; print(f'SkyPilot installed: {sky.__version__}')"
+  fi
   
   # Configure SkyPilot for jobs consolidation mode (runs jobs controller locally)
+  # This is always needed regardless of image
   echo "=== Configuring SkyPilot ==="
   mkdir -p ~/.sky
   echo "jobs:" > ~/.sky/config.yaml

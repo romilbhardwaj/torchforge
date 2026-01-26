@@ -173,13 +173,13 @@ services:
     procs: 1
     num_replicas: 1
     with_gpus: false
-    mesh_name: ref_model  # Share mesh with ref_model (CPU-only service)
+    mesh_name: reward_actor
 
 actors:
   dataset:
     procs: 1
     with_gpus: false
-    mesh_name: generator  # Share mesh with generator
+    mesh_name: dataset
   trainer:
     procs: 1
     hosts: 1
@@ -188,8 +188,8 @@ actors:
   replay_buffer:
     procs: 1
     with_gpus: false
-    mesh_name: trainer  # Share mesh with trainer
+    mesh_name: replay_buffer
   compute_advantages:
     procs: 1
     with_gpus: false
-    mesh_name: trainer  # Share mesh with trainer
+    mesh_name: compute_advantages

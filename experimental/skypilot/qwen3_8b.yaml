@@ -40,7 +40,7 @@ provisioner:
     # GPU meshes get H100s, CPU-only meshes override to remove accelerators
     mesh_resources:
       generator:
-        accelerators: "H100:2"
+        accelerators: "H100:1"
         memory: "64+"
       trainer:
         accelerators: "H100:2"

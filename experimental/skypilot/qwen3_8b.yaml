@@ -70,7 +70,7 @@ dataset:
 generator:
   engine_args:
     model: ${model}
-    tensor_parallel_size: 2  # Set to 2 to match H100:2 per node
+    tensor_parallel_size: 1  # Must match generator accelerators (H100:1)
     pipeline_parallel_size: 1
     enforce_eager: ${not:${compile}}
   sampling_params:

@@ -27,7 +27,7 @@ provisioner:
   skypilot_args:
     # Cloud configuration
     cloud: kubernetes
-    image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+    image_id: docker:romilb/torchforge:latest
     idle_minutes_to_autostop: 30
     model_name: ${model}  # Model to pre-download on workers
 

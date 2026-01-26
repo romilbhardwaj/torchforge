@@ -309,6 +309,12 @@ except Exception as e:
         )
         return f"{env_vars} && {self._python_exe} -c '{escaped_code}'"
 
+    def _mesh_has_gpus(self, mesh_name: str) -> bool:
+        """Check if a mesh has GPU accelerators configured."""
+        resources = self._get_mesh_resources(mesh_name)
+        accelerators = resources.get("accelerators")
+        return accelerators is not None and accelerators != "null"
+
     def _create_job_group_yaml(self) -> str:
         """Create a multi-document YAML string for the JobGroup."""
         import yaml
@@ -366,9 +372,17 @@ except Exception as e:
             if self._file_mounts:
                 task_doc["file_mounts"] = self._file_mounts
 
-            # Add envs if specified
+            # Add envs - only include MODEL_NAME for GPU meshes (CPU meshes don't need model)
+            task_envs = {}
             if self._envs:
-                task_doc["envs"] = dict(self._envs)
+                for key, value in self._envs.items():
+                    # Only pass MODEL_NAME to GPU meshes
+                    if key == "MODEL_NAME" and not self._mesh_has_gpus(mesh_name):
+                        logger.info(f"Skipping MODEL_NAME for CPU-only mesh '{mesh_name}'")
+                        continue
+                    task_envs[key] = value
+            if task_envs:
+                task_doc["envs"] = task_envs
 
             task_docs.append(task_doc)
 
@@ -379,20 +393,6 @@ except Exception as e:
             yaml_parts.append(yaml.dump(task_doc, default_flow_style=False))
 
         return "\n".join(yaml_parts)
-
-    def _cleanup_on_failure(self) -> None:
-        """Clean up job resources on failure."""
-        if self._job_id is not None:
-            try:
-                logger.warning(f"Cleaning up job {self._job_id} after failure")
-                request_id = sky_jobs.cancel(job_ids=[self._job_id])
-                sky.get(request_id)
-                logger.info(f"Job {self._job_id} cancelled")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to cleanup job: {cleanup_error}")
-            finally:
-                self._job_id = None
-                self._mesh_ips.clear()
 
     def _create(self, client_script: str | None) -> None:
         """Launch a SkyPilot JobGroup with tasks for each mesh."""
@@ -431,7 +431,7 @@ except Exception as e:
 
         except Exception as e:
             logger.error(f"Failed to launch JobGroup: {e}")
-            self._cleanup_on_failure()
+            self._kill()
             raise RuntimeError(f"Failed to launch JobGroup: {e}") from e
         finally:
             # Clean up temp file
@@ -445,41 +445,38 @@ except Exception as e:
             self._wait_for_job_group_running(timeout=JOB_TIMEOUT)
         except Exception as e:
             logger.error(f"JobGroup failed to reach RUNNING status: {e}")
-            self._cleanup_on_failure()
+            self._kill()
             raise
 
-        # Wait for workers to complete setup (deps install, model download) and start
-        # Worker setup can take several minutes due to:
-        # - Installing TorchForge dependencies
-        # - Downloading HuggingFace models (can be 16GB+)
-        # - Starting the Monarch worker loop
-        setup_wait_time = 300  # 5 minutes
-        logger.info(f"Waiting {setup_wait_time}s for workers to complete setup and start...")
-        time.sleep(setup_wait_time)
-        logger.info("Workers should be ready now")
+        logger.info("All tasks RUNNING, workers will start after setup completes")
 
     def _wait_for_job_group_running(self, timeout: int = JOB_TIMEOUT) -> None:
-        """Wait for all tasks in the JobGroup to reach RUNNING status."""
+        """Wait for all tasks in the JobGroup to reach RUNNING status.
+        
+        Uses two strategies:
+        1. Try SkyPilot jobs queue API (may fail in consolidation mode)
+        2. Fall back to checking cluster handles directly
+        """
         start_time = time.time()
-        poll_interval = 15  # seconds
+        poll_interval = 10  # seconds
         # Use sanitized names to match what we created in the YAML
         expected_tasks = set(_sanitize_dns_name(name) for name in self._meshes.keys())
+        api_failures = 0
 
         logger.info(
             f"Waiting for JobGroup tasks to start (timeout={timeout}s)..."
         )
 
         while time.time() - start_time < timeout:
+            running_tasks = set()
+            failed_tasks = set()
+            
             try:
-                # Query job status - use refresh=False to avoid issues with
-                # consolidation mode (no remote jobs controller exists)
+                # Strategy 1: Try jobs queue API
                 request_id = sky_jobs.queue(
                     refresh=False, job_ids=[self._job_id]
                 )
                 jobs = sky.get(request_id)
-
-                running_tasks = set()
-                failed_tasks = set()
 
                 for task_record in jobs:
                     task_name = task_record.get("task_name")
@@ -498,20 +495,36 @@ except Exception as e:
                         f"Tasks failed: {failed_tasks}. "
                         f"Check logs with: sky jobs logs {self._job_id}"
                     )
-
-                # Wait for all tasks to be RUNNING
-                if running_tasks == expected_tasks:
-                    logger.info(f"All {len(expected_tasks)} tasks are RUNNING")
-                    return
-
-                elapsed = int(time.time() - start_time)
-                logger.info(
-                    f"Tasks running: {len(running_tasks)}/{len(expected_tasks)} "
-                    f"(waited {elapsed}s)"
-                )
+                
+                api_failures = 0  # Reset on success
 
             except Exception as e:
-                logger.warning(f"Error checking job status: {e}")
+                api_failures += 1
+                # Strategy 2: Fall back to checking cluster handles
+                if api_failures >= 3:
+                    logger.info("Job queue API not working, checking cluster handles...")
+                    for mesh_name in self._meshes.keys():
+                        dns_safe_name = _sanitize_dns_name(mesh_name)
+                        cluster_name = self._generate_cluster_name(dns_safe_name, self._job_id)
+                        try:
+                            handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+                            if handle is not None and handle.stable_internal_external_ips:
+                                running_tasks.add(dns_safe_name)
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(f"Error checking job status: {e}")
+
+            # Check if all tasks are running
+            if running_tasks == expected_tasks:
+                logger.info(f"All {len(expected_tasks)} tasks are RUNNING")
+                return
+
+            elapsed = int(time.time() - start_time)
+            logger.info(
+                f"Tasks running: {len(running_tasks)}/{len(expected_tasks)} "
+                f"(waited {elapsed}s)"
+            )
 
             time.sleep(poll_interval)
 
@@ -607,10 +620,6 @@ except Exception as e:
             # Wait for the host mesh to be initialized
             logger.info(f"Waiting for host mesh '{mesh_name}' to initialize...")
             host_mesh.initialized.get()
-            logger.info(f"Host mesh '{mesh_name}' initialized successfully")
-
-            # Give connections a moment to stabilize
-            time.sleep(3)
             logger.info(f"Host mesh '{mesh_name}' ready")
 
             host_meshes[mesh_name] = host_mesh

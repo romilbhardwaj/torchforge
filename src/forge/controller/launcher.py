@@ -173,6 +173,7 @@ class SkyPilotLauncher(BaseLauncher):
         skypilot_args = self.cfg.skypilot_args or {}
 
         cloud = skypilot_args.get("cloud")
+        infra = skypilot_args.get("infra")  # e.g., "kubernetes/sky-dev"
         image_id = skypilot_args.get("image_id")
         idle_minutes_to_autostop = skypilot_args.get("idle_minutes_to_autostop", 30)
         model_name = skypilot_args.get("model_name")
@@ -205,6 +206,7 @@ class SkyPilotLauncher(BaseLauncher):
             default_mesh_resources=default_mesh_resources,
             mesh_resources=mesh_resources,
             cloud=cloud,
+            infra=infra,  # e.g., "kubernetes/sky-dev" - ensures workers go to same cluster as driver
             image_id=image_id,
             cluster_name=self.cfg.job_name + "_workers" if self.cfg.job_name else None,
             idle_minutes_to_autostop=idle_minutes_to_autostop,

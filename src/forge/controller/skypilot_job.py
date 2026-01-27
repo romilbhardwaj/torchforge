@@ -185,6 +185,7 @@ class SkyPilotJob(JobTrait):
         default_mesh_resources: dict[str, Any] | None = None,
         mesh_resources: dict[str, dict[str, Any]] | None = None,
         cloud: str | None = None,
+        infra: str | None = None,
         image_id: str | None = None,
         cluster_name: str | None = None,
         monarch_port: int = MONARCH_WORKER_PORT,
@@ -204,6 +205,7 @@ class SkyPilotJob(JobTrait):
             mesh_resources: Per-mesh resource overrides (merged with defaults).
                     e.g., {"generator": {"accelerators": "H100:2"}}
             cloud: Cloud provider (kubernetes, aws, gcp, azure).
+            infra: Infrastructure specifier with context (e.g., "kubernetes/sky-dev").
             image_id: Docker image for workers.
             cluster_name: Base name for the SkyPilot clusters.
             monarch_port: Port for Monarch worker communication.
@@ -232,6 +234,7 @@ class SkyPilotJob(JobTrait):
         self._default_mesh_resources = default_mesh_resources or {}
         self._mesh_resources = mesh_resources or {}
         self._cloud = cloud
+        self._infra = infra  # e.g., "kubernetes/sky-dev"
         self._image_id = image_id or DEFAULT_IMAGE_ID
         self._cluster_name = cluster_name
         self._port = monarch_port
@@ -360,7 +363,10 @@ except Exception as e:
 
             # Convert resources to YAML-compatible dict
             res_dict = {}
-            if resources.cloud:
+            # Prefer infra over cloud (infra includes context like kubernetes/sky-dev)
+            if self._infra:
+                res_dict["infra"] = self._infra
+            elif resources.cloud:
                 res_dict["cloud"] = str(resources.cloud).lower()
             if resources.accelerators:
                 # Convert accelerators dict to string format
@@ -569,17 +575,163 @@ except Exception as e:
     def _get_mesh_ips(self, mesh_name: str) -> list[str]:
         """Get IP addresses for a specific mesh's cluster.
         
-        Uses SkyPilot's cluster handle to get the actual pod/VM IPs.
-        These IPs are routable from the driver pod to the worker pods.
+        For Kubernetes deployments, queries pod IPs directly using kubectl since 
+        managed job task clusters may not be visible via sky status API.
+        Falls back to SkyPilot SDK for non-Kubernetes deployments.
+        
+        Retries with backoff since pods may take time to be created and running.
         """
+        import time
+        
         # Sanitize mesh name for DNS compatibility (matching what we used in YAML)
         dns_safe_name = _sanitize_dns_name(mesh_name)
         # Generate cluster name using SkyPilot's naming convention
         cluster_name = self._generate_cluster_name(dns_safe_name, self._job_id)
         logger.info(f"Looking for cluster '{cluster_name}' for mesh '{mesh_name}'")
 
-        # Get handle from cluster name
-        handle = global_user_state.get_handle_from_cluster_name(cluster_name)
+        # Retry with backoff - pods may take time to be created
+        max_retries = 30  # Up to 5 minutes of waiting
+        retry_delay = 10  # seconds
+        
+        for attempt in range(max_retries):
+            # Try Kubernetes direct query first (for managed jobs, task clusters are not
+            # visible via sky status, so we query K8s directly)
+            ips = self._get_mesh_ips_from_kubernetes(cluster_name)
+            if ips:
+                logger.info(f"Mesh '{mesh_name}' IPs (from K8s): {ips}")
+                return ips
+            
+            # Also try SkyPilot SDK (may work for some configurations)
+            try:
+                ips = self._get_mesh_ips_from_skypilot_no_raise(cluster_name, mesh_name)
+                if ips:
+                    logger.info(f"Mesh '{mesh_name}' IPs (from SkyPilot): {ips}")
+                    return ips
+            except Exception as e:
+                logger.debug(f"SkyPilot SDK query failed: {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"No IPs found for '{cluster_name}' yet, waiting {retry_delay}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(retry_delay)
+        
+        # Final attempt failed - raise error with debug info
+        raise RuntimeError(
+            f"Could not find IPs for cluster '{cluster_name}' after {max_retries} attempts. "
+            f"Pods may not have been created or are not running yet."
+        )
+
+    def _get_mesh_ips_from_kubernetes(self, cluster_name: str) -> list[str]:
+        """Query Kubernetes directly for pod IPs matching the cluster name.
+        
+        SkyPilot pods are named like: {cluster_name}-head, {cluster_name}-worker-0, etc.
+        We query pods with label skypilot-cluster={cluster_name} or by name pattern.
+        Searches all namespaces to handle managed jobs running in different namespaces.
+        
+        Uses explicit --context flag when infra is specified (e.g., kubernetes/sky-dev)
+        to ensure we query the correct cluster where workers are running.
+        """
+        import subprocess
+        
+        # Parse context from infra (e.g., "kubernetes/sky-dev" -> "sky-dev")
+        context_args = []
+        if self._infra and "/" in self._infra:
+            context_name = self._infra.split("/", 1)[1]
+            context_args = ["--context", context_name]
+            logger.info(f"Using kubectl context: {context_name}")
+        
+        try:
+            # Query pods with the cluster name label across ALL namespaces
+            # SkyPilot sets skypilot-cluster label on pods
+            cmd = [
+                "kubectl", "get", "pods",
+                *context_args,
+                "--all-namespaces",
+                "-l", f"skypilot-cluster={cluster_name}",
+                "-o", "jsonpath={.items[*].status.podIP}",
+                "--field-selector=status.phase=Running"
+            ]
+            logger.info(f"Running kubectl command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                ips = result.stdout.strip().split()
+                logger.info(f"Found {len(ips)} pod IPs for cluster '{cluster_name}': {ips}")
+                return ips
+            else:
+                logger.info(f"kubectl label query returned: rc={result.returncode}, stdout='{result.stdout}', stderr='{result.stderr}'")
+            
+            # If label query fails, try querying by pod name pattern across all namespaces
+            # SkyPilot names pods like: {cluster_name}-head
+            cmd = [
+                "kubectl", "get", "pods",
+                *context_args,
+                "--all-namespaces",
+                "-o", "jsonpath={range .items[*]}{.metadata.name}:{.status.podIP}{\"\\n\"}{end}",
+                "--field-selector=status.phase=Running"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                ips = []
+                all_pods = []
+                for line in result.stdout.strip().split('\n'):
+                    if ':' in line:
+                        pod_name, pod_ip = line.split(':', 1)
+                        all_pods.append(pod_name)
+                        # Match pods starting with our cluster name
+                        if pod_name.startswith(cluster_name) and pod_ip:
+                            ips.append(pod_ip)
+                if ips:
+                    logger.info(f"Found {len(ips)} pod IPs by name for cluster '{cluster_name}': {ips}")
+                    return ips
+                else:
+                    # Log what pods we did find to help debug naming
+                    logger.info(f"No pods matching '{cluster_name}'. Available pods: {all_pods[:20]}...")
+            else:
+                logger.info(f"kubectl name query returned: rc={result.returncode}, stderr='{result.stderr}'")
+            
+            return []
+            
+        except subprocess.TimeoutExpired:
+            logger.warning(f"kubectl command timed out for cluster '{cluster_name}'")
+            return []
+        except FileNotFoundError:
+            logger.warning("kubectl not found, cannot query Kubernetes directly")
+            return []
+        except Exception as e:
+            logger.warning(f"Error querying Kubernetes for cluster '{cluster_name}': {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def _get_mesh_ips_from_skypilot(self, cluster_name: str, mesh_name: str) -> list[str]:
+        """Get mesh IPs using SkyPilot SDK.
+        
+        This works for regular clusters but may not work for managed job task clusters
+        which are not exposed via sky status.
+        """
+        # Use SkyPilot SDK to get cluster info
+        request_id = sky.status(cluster_names=[cluster_name], refresh='NONE', all_users=True)
+        clusters = sky.stream_and_get(request_id)
+        
+        if not clusters:
+            # Debug: list all available clusters to help diagnose naming issues
+            try:
+                all_clusters_req = sky.status(refresh='NONE', all_users=True)
+                all_clusters = sky.stream_and_get(all_clusters_req)
+                all_cluster_names = [c.name for c in all_clusters] if all_clusters else []
+                logger.info(f"Available clusters: {all_cluster_names}")
+            except Exception as e:
+                logger.warning(f"Could not list all clusters: {e}")
+            raise RuntimeError(
+                f"No cluster found with name '{cluster_name}'. "
+                f"Cluster may not be fully initialized yet."
+            )
+        
+        cluster_info = clusters[0]
+        # StatusResponse is a pydantic model - access handle as attribute not dict key
+        handle = cluster_info.handle
+        
         if handle is None:
             raise RuntimeError(
                 f"No handle found for cluster '{cluster_name}'. "
@@ -597,8 +749,38 @@ except Exception as e:
             if ip:
                 ips.append(ip)
 
-        logger.info(f"Mesh '{mesh_name}' IPs: {ips}")
+        logger.info(f"Mesh '{mesh_name}' IPs (from SkyPilot): {ips}")
         return ips
+
+    def _get_mesh_ips_from_skypilot_no_raise(self, cluster_name: str, mesh_name: str) -> list[str]:
+        """Get mesh IPs using SkyPilot SDK, returning empty list instead of raising.
+        
+        Same as _get_mesh_ips_from_skypilot but returns [] instead of raising
+        when cluster is not found. Used during retry loops.
+        """
+        try:
+            # Use SkyPilot SDK to get cluster info
+            request_id = sky.status(cluster_names=[cluster_name], refresh='NONE', all_users=True)
+            clusters = sky.stream_and_get(request_id)
+            
+            if not clusters:
+                return []
+            
+            cluster_info = clusters[0]
+            handle = cluster_info.handle
+            
+            if handle is None or handle.stable_internal_external_ips is None:
+                return []
+
+            # Extract IPs - prefer internal for K8s, external for cloud
+            ips = []
+            for internal_ip, external_ip in handle.stable_internal_external_ips:
+                ip = internal_ip if internal_ip else external_ip
+                if ip:
+                    ips.append(ip)
+            return ips
+        except Exception:
+            return []
 
     def _state(self) -> JobState:
         """Get the current state with HostMesh objects for each mesh."""

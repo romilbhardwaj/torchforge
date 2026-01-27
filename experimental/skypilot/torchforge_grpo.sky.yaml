@@ -13,11 +13,28 @@
 #                                         +--> JobGroup Task: trainer (H100:1)
 #                                         +--> JobGroup Task: ref_model (H100:1)
 #
-# Usage:
-#   # From your laptop (outside the cluster):
-#   cd torchforge/experimental/skypilot
-#   sky launch torchforge_grpo.sky.yaml -c forge-grpo
+# Two authentication modes are supported:
 #
+# MODE 1: Local in-cluster auth (default)
+#   Uses the driver pod's in-cluster Kubernetes service account.
+#   A local SkyPilot API server is started inside the driver pod.
+#
+#   Usage:
+#     cd torchforge/experimental/skypilot
+#     sky launch torchforge_grpo.sky.yaml -c forge-grpo
+#
+# MODE 2: Remote API server with HTTP Basic Auth
+#   Uses a remote SkyPilot API server for cluster management.
+#   Credentials are embedded in the endpoint URL.
+#
+#   Create a secrets file (e.g., .skysecret):
+#     SKYPILOT_API_SERVER_ENDPOINT=http://username:password@your-api-server.example.com
+#
+#   Usage:
+#     sky launch torchforge_grpo.sky.yaml -c forge-grpo \
+#       --secret-file .skysecret
+#
+# Common options:
 #   # With custom configuration:
 #   sky launch torchforge_grpo.sky.yaml -c forge-grpo \
 #     --env CONFIG=qwen3_8b.yaml
@@ -38,7 +55,7 @@
 name: torchforge-grpo
 
 resources:
-  cloud: kubernetes  # Driver pod runs on Kubernetes
+  infra: kubernetes/sky-dev  # Driver pod runs on Kubernetes
   cpus: 4+
   memory: 16+
   # Pre-built TorchForge image with all dependencies
@@ -49,6 +66,15 @@ resources:
 # Override with: sky launch ... --env CONFIG=my_config.yaml
 envs:
   CONFIG: qwen3_8b.yaml  # TorchForge GRPO config file
+  SKYPILOT_DEV: "1"  # Enable dev mode to surface JobGroup pods as clusters
+
+# Optional secrets for remote API server authentication (MODE 2)
+# Pass via: sky launch ... --secret-file .skysecret
+# The secrets file should contain (with credentials in URL for basic auth):
+#   SKYPILOT_API_SERVER_ENDPOINT=http://username:password@your-api-server.example.com
+secrets:
+  SKYPILOT_API_SERVER_ENDPOINT: ""
+
 
 # Sync the TorchForge repository to the cluster
 workdir: ../..
@@ -101,31 +127,53 @@ setup: |
     python -c "import forge; print(f'TorchForge installed successfully')"
     python -c "import monarch; print(f'Monarch installed: {monarch}')"
     python -c "import sky; print(f'SkyPilot installed: {sky.__version__}')"
+  else
+    # Even with pre-built image, reinstall forge from workdir to pick up local changes
+    echo "=== Reinstalling TorchForge from workdir (to pick up local changes) ==="
+    cd ~/sky_workdir
+    uv pip install --system -e "." --no-deps
+    python -c "import forge; print(f'TorchForge location: {forge.__file__}')"
   fi
   
-  # Configure SkyPilot for jobs consolidation mode (runs jobs controller locally)
-  # This is always needed regardless of image
-  echo "=== Configuring SkyPilot ==="
-  mkdir -p ~/.sky
-  echo "jobs:" > ~/.sky/config.yaml
-  echo "  controller:" >> ~/.sky/config.yaml
-  echo "    consolidation_mode: true" >> ~/.sky/config.yaml
-  echo "  force_disable_cloud_bucket: true" >> ~/.sky/config.yaml
-  echo "SkyPilot config:"
-  cat ~/.sky/config.yaml
+  # Check if using remote API server or local in-cluster auth
+  if [ -n "${SKYPILOT_API_SERVER_ENDPOINT:-}" ]; then
+    echo "=== Using remote SkyPilot API server: $SKYPILOT_API_SERVER_ENDPOINT ==="
+    # Remote API server mode - authenticate with service account token
+    # The SKYPILOT_API_SERVER_ENDPOINT and SKYPILOT_SERVICE_ACCOUNT_TOKEN env vars
+    # are automatically used by SkyPilot SDK/CLI for authentication
+    echo "Verifying connection to remote API server..."
+    sky api info
+    sky api status
+  else
+    echo "=== Using local in-cluster SkyPilot API server ==="
+    # Local mode - start a local API server with in-cluster Kubernetes auth
+    
+    # Configure SkyPilot for jobs consolidation mode (runs jobs controller locally)
+    echo "=== Configuring SkyPilot ==="
+    mkdir -p ~/.sky
+    echo "jobs:" > ~/.sky/config.yaml
+    echo "  controller:" >> ~/.sky/config.yaml
+    echo "    consolidation_mode: true" >> ~/.sky/config.yaml
+    echo "  force_disable_cloud_bucket: true" >> ~/.sky/config.yaml
+    echo "SkyPilot config:"
+    cat ~/.sky/config.yaml
+    
+    # Configure SkyPilot to use in-cluster Kubernetes context
+    unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
+    
+    # Stop any existing API server and start fresh (to pick up config)
+    sky api stop || true
+    sleep 5  # Wait for server to fully stop
+    sky api start
+    sleep 10  # Wait for server to fully start with new config
+    
+    # Verify consolidation mode is active
+    echo "=== Verifying local API server ==="
+    sky api info
+    sky api status
+  fi
   
-  # Configure SkyPilot to use in-cluster Kubernetes context
-  unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
-  
-  # Stop any existing API server and start fresh (to pick up config)
-  sky api stop || true
-  sleep 5  # Wait for server to fully stop
-  sky api start
-  sleep 10  # Wait for server to fully start with new config
-  
-  # Verify consolidation mode is active
-  echo "=== Verifying consolidation mode ==="
-  sky api status
+  # Common verification steps
   sky jobs queue || echo "No jobs yet"
   
   # Verify Kubernetes access
@@ -148,8 +196,11 @@ run: |
   # Set USER env var (not set in container by default, but used by some configs)
   export USER=$(whoami)
   
-  # Ensure SkyPilot uses the correct Kubernetes context
-  unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
+  # For local in-cluster mode, ensure SkyPilot uses the correct Kubernetes context
+  # Skip this if using remote API server (env vars handle auth)
+  if [ -z "${SKYPILOT_API_SERVER_ENDPOINT:-}" ]; then
+    unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
+  fi
   
   # Set Hyperactor/Monarch timeouts for proc mesh spawn and message delivery
   # These are needed on the driver to allow time for workers to start

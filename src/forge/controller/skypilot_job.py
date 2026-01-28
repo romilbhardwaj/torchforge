@@ -447,11 +447,18 @@ except Exception as e:
             request_id = sky_jobs.launch(dag)
             result = sky.get(request_id)
 
-            # Result is (job_id, handle)
+            # Extract job_id from result - handle various return formats
+            # Result can be: int, (job_id, handle), or [job_id]
             if isinstance(result, tuple):
+                self._job_id = result[0]
+            elif isinstance(result, list):
                 self._job_id = result[0]
             else:
                 self._job_id = result
+            
+            # Ensure job_id is an integer
+            if isinstance(self._job_id, list):
+                self._job_id = self._job_id[0]
 
             logger.info(f"JobGroup launched with job_id: {self._job_id}")
 

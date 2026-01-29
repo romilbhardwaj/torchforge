@@ -2,12 +2,11 @@
 
 This directory contains examples for running TorchForge GRPO training on **Kubernetes and cloud VMs** via [SkyPilot](https://github.com/skypilot-org/skypilot).
 
-## Overview
-
-The SkyPilot integration allows TorchForge to provision and manage distributed training workloads across:
-- **Kubernetes** (any cluster)
-- **Hyperscalers**: AWS, GCP, Azure
-- **Neoclouds**: CoreWeave, Nebius, and [20+ other clouds](https://docs.skypilot.co/en/latest/getting-started/installation.html)
+In a nutshell:
+```bash
+pip install skypilot-nightly[kubernetes]
+sky launch torchforge_grpo.sky.yaml -c forge-grpo
+```
 
 ### Architecture
 
@@ -59,9 +58,6 @@ flowchart LR
 
 ```bash
 pip install skypilot-nightly[kubernetes]  # For Kubernetes
-pip install skypilot-nightly[aws]         # For AWS
-pip install skypilot-nightly[gcp]         # For GCP
-pip install skypilot-nightly[all]         # For all clouds
 ```
 
 2. **Verify SkyPilot setup**:
@@ -73,13 +69,31 @@ sky show-gpus --infra kubernetes  # For K8s
 
 For detailed setup, see the [SkyPilot documentation](https://docs.skypilot.co/en/latest/getting-started/installation.html).
 
+### Remote API Server Credentials
+
+If you're using a **remote SkyPilot API server** (instead of local kubectl), you need to pass credentials via a secret file:
+
+1. **Create a `.skysecret` file** with your API server endpoint:
+
+```bash
+# .skysecret
+SKYPILOT_API_SERVER_ENDPOINT=https://username:password@your-api-server.example.com
+# SKYPILOT_SERVICE_ACCOUNT_TOKEN=sky_ # If using SSO + service account authentication
+```
+
+2. **Pass the secret file when launching**:
+
+```bash
+sky launch torchforge_grpo.sky.yaml -c forge-grpo --secret-file .skysecret
+```
+
 ### Running GRPO Training
 
 From your local machine (with kubectl/kubeconfig configured):
 
 ```bash
 cd torchforge/experimental/skypilot
-sky launch torchforge_grpo.sky.yaml -c forge-grpo
+sky launch torchforge_grpo.sky.yaml -c forge-grpo # Optional: --secret-file .skysecret
 ```
 
 This will:
@@ -127,8 +141,8 @@ provisioner:
   launcher: skypilot
   job_name: my_grpo_job
   skypilot_args:
-    # Cloud configuration
-    cloud: kubernetes      # Cloud provider: kubernetes, aws, gcp, azure
+    # Cloud/infra configuration (optional - auto-detected from driver environment)
+    # infra: kubernetes/my-context  # Explicit override if needed
     image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
     idle_minutes_to_autostop: 30
     model_name: Qwen/Qwen3-8B  # HuggingFace model to pre-download
@@ -166,6 +180,21 @@ Resources are specified per-mesh and merged with defaults:
 | `image_id` | str | Docker image (per-mesh override) | `"docker:my-image:tag"` |
 
 **Resolution order**: `mesh_resources[mesh_name]` → `default_mesh_resources` → SkyPilot defaults
+
+### Infra Auto-Detection
+
+When the driver runs inside a SkyPilot cluster, the `infra` is **automatically detected** from the `SKYPILOT_CLUSTER_INFO` environment variable. This means:
+
+- You don't need to specify `cloud` or `infra` in your config
+- Workers are automatically launched on the same infrastructure as the driver
+- The detected value is logged: `Auto-detected infra from SKYPILOT_CLUSTER_INFO: kubernetes/my-context`
+
+To **explicitly override** (e.g., launch workers on a different cluster):
+
+```yaml
+skypilot_args:
+  infra: kubernetes/other-context  # Explicit override
+```
 
 ### Model Pre-download
 
@@ -239,22 +268,6 @@ provisioner:
         cpus: "8+"
 ```
 
-## Supported Clouds
-
-| Cloud | Installation | Notes |
-|-------|--------------|-------|
-| Kubernetes | `pip install skypilot[kubernetes]` | Driver must run inside cluster |
-| AWS | `pip install skypilot[aws]` | Requires AWS credentials |
-| GCP | `pip install skypilot[gcp]` | Requires GCP credentials |
-| Azure | `pip install skypilot[azure]` | Requires Azure credentials |
-
-See [SkyPilot Cloud Setup](https://docs.skypilot.co/en/latest/getting-started/installation.html) for credential configuration.
-
-## Network Requirements
-
-- **Kubernetes**: The driver pod must be inside the same cluster as worker pods
-- **Cloud VMs**: Security groups must allow inbound traffic on port 22222
-
 ## Dependency Management
 
 Worker pods install dependencies using `uv pip install -e .` from the synced TorchForge repository. This respects `pyproject.toml`'s `[tool.uv.sources]` section, which is critical for:
@@ -316,20 +329,6 @@ sky jobs logs <job_id>
 sky jobs logs <job_id> --controller  # Controller logs
 ```
 
-### Common Issues
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| `ModuleNotFoundError: No module named 'vllm.executor'` | Wrong vllm version on workers | Ensure workers install TorchForge using `uv pip install -e .` (respects pyproject.toml index sources) |
-| `checkpoint.initial_load_path is not valid` | Model not downloaded on workers | Add `model_name` to `skypilot_args` |
-| `SkyPilot is not installed` | Missing SkyPilot on driver | Check `torchforge_grpo.sky.yaml` setup script installs `skypilot[kubernetes]` |
-| Connection timeout | Network issues | Ensure driver and workers are in the same cluster/VPC; check port 22222 is open |
-| GPU not available | Scheduling issues | Check `sky show-gpus --infra kubernetes` for available GPUs |
-| Pod scheduling issues | Resource constraints | Check Kubernetes node resources, taints, and tolerations |
-| `Timeout spawning proc mesh` | Mismatch between requested procs and available GPUs | Ensure `procs` ≤ `accelerators` GPU count (e.g., `procs: 1` with `H100:1`) |
-| Slow workdir sync | Large .git directory | Add `.skyignore` with `.git/` |
-| `torchmonarch` serialization error | Version mismatch | Ensure workers install the exact same `torchmonarch-nightly` version as driver |
-
 ### Debugging Workflow
 
 1. **Launch and monitor**:
@@ -367,6 +366,7 @@ sky jobs logs <job_id> --controller  # Controller logs
 |------|-------------|
 | `torchforge_grpo.sky.yaml` | SkyPilot task YAML to launch the driver pod |
 | `qwen3_8b.yaml` | TorchForge GRPO config for Qwen3-8B on SkyPilot |
+| `.skysecret` | Secret file with API server credentials (not in git) |
 | `README.md` | This documentation |
 
 ## Implementation Details

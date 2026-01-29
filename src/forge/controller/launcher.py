@@ -244,6 +244,10 @@ class SkyPilotLauncher(BaseLauncher):
         SkyPilot sets this env var when running inside a cluster, containing JSON like:
         {"cluster_name": "my-cluster", "cloud": "kubernetes", "region": "sky-dev", ...}
         
+        For local API server mode (no SKYPILOT_API_SERVER_ENDPOINT), we just return the
+        cloud name (e.g., "kubernetes") without a specific context, letting SkyPilot use
+        the current kubectl context.
+        
         Returns:
             Infra string like "kubernetes/sky-dev" or "aws/us-west-2", or None if not available.
         """
@@ -260,6 +264,13 @@ class SkyPilotLauncher(BaseLauncher):
             cloud = cluster_info.get("cloud", "").lower()
             region = cluster_info.get("region", "")
             
+            # Check if using local API server (no remote endpoint configured)
+            # In local mode, just use the cloud name and let SkyPilot pick the current context
+            api_server_endpoint = os.environ.get("SKYPILOT_API_SERVER_ENDPOINT")
+            if not api_server_endpoint and cloud == "kubernetes":
+                logger.info(f"Local API server mode detected, using infra: {cloud}")
+                return cloud
+
             if cloud and region:
                 infra = f"{cloud}/{region}"
                 logger.info(f"Detected infra from SKYPILOT_CLUSTER_INFO: {infra}")

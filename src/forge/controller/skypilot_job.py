@@ -638,6 +638,10 @@ except Exception as e:
         
         Uses explicit --context flag when infra is specified (e.g., kubernetes/sky-dev)
         to ensure we query the correct cluster where workers are running.
+
+        TODO(romilb): This is a hack to get the pod IPs. We should have SkyPilot 
+         expose the ResourceHandles for JobGroups so we can get the pod IPs from 
+         SkyPilot SDK instead of querying Kubernetes directly.
         """
         import subprocess
         

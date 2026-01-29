@@ -20,25 +20,22 @@ model: "Qwen/Qwen3-8B"
 off_by_n: 1  # Off by one by default
 compile: true  # Enable torch.compile for trainer/ref_model, and CUDA graphs for vLLM
 
-# SkyPilot provisioner configuration using JobGroups
+# SkyPilot provisioner configuration
 provisioner:
   launcher: skypilot
   job_name: forge-grpo-qwen3-8b
   skypilot_args:
-    # Cloud configuration - use same infra as driver to ensure kubectl can find pods
-    infra: kubernetes/sky-dev
-    image_id: docker:romilb/torchforge:latest
-    idle_minutes_to_autostop: 30
+    image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
     model_name: ${model}  # Model to pre-download on workers
-
     # Default resources for meshes without explicit overrides
     default_mesh_resources:
       cpus: "4+"
       memory: "32+"
-
     # Per-mesh resource overrides (merged with defaults)
-    # GPU meshes get H100s, CPU-only meshes override to remove accelerators
+    # GPU meshes can request different GPU SKUs and quantities
     mesh_resources:
+      reward_actor:
+        cpus: "16+"
       generator:
         accelerators: "H100:1"
         memory: "64+"

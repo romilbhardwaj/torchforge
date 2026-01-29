@@ -377,8 +377,10 @@ except Exception as e:
                 res_dict["cpus"] = resources.cpus
             if resources.memory:
                 res_dict["memory"] = resources.memory
-            if resources.image_id:
-                res_dict["image_id"] = resources.image_id
+            mesh_res = self._get_mesh_resources(mesh_name)
+            image_id = mesh_res.get("image_id", self._image_id)
+            if image_id:
+                res_dict["image_id"] = image_id
 
             # Sanitize mesh name for DNS compatibility
             dns_safe_name = _sanitize_dns_name(mesh_name)

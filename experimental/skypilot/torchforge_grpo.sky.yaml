@@ -34,17 +34,12 @@
 #     sky launch torchforge_grpo.sky.yaml -c forge-grpo \
 #       --secret-file .skysecret
 #
-# Common options:
-#   # With custom configuration:
-#   sky launch torchforge_grpo.sky.yaml -c forge-grpo \
-#     --env CONFIG=qwen3_8b.yaml
-#
 # To view logs:
 #   sky logs forge-grpo
 #
 # To view worker logs:
 #   sky jobs queue  # Find job ID
-#   sky jobs logs <job_id>
+#   sky jobs logs <jobgroup_id> <task_id>
 #
 # To SSH into the driver:
 #   ssh forge-grpo
@@ -55,25 +50,24 @@
 name: torchforge-grpo
 
 resources:
-  infra: kubernetes/sky-dev  # Driver pod runs on Kubernetes
+  infra: kubernetes/coreweave-dev  # Change to your own context name
   cpus: 4+
   memory: 16+
-  # Pre-built TorchForge image with all dependencies
-  # Rebuild with: experimental/skypilot/docker-builder.sky.yaml
-  image_id: docker:romilb/torchforge:latest
+  # Optional: use a custom TorchForge image with all dependencies pre-baked
+  image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 
 # Environment variables for configuration
 # Override with: sky launch ... --env CONFIG=my_config.yaml
 envs:
   CONFIG: qwen3_8b.yaml  # TorchForge GRPO config file
-  SKYPILOT_DEV: "1"  # Enable dev mode to surface JobGroup pods as clusters
 
 # Optional secrets for remote API server authentication (MODE 2)
 # Pass via: sky launch ... --secret-file .skysecret
 # The secrets file should contain (with credentials in URL for basic auth):
 #   SKYPILOT_API_SERVER_ENDPOINT=http://username:password@your-api-server.example.com
-secrets:
-  SKYPILOT_API_SERVER_ENDPOINT: ""
+# secrets:
+#   SKYPILOT_API_SERVER_ENDPOINT: ""
+#   WANDB_API_KEY: ""
 
 
 # Sync the TorchForge repository to the cluster
@@ -90,7 +84,7 @@ setup: |
     python -c "import forge; import monarch; import sky; print(f'forge OK, monarch OK, sky={sky.__version__}')"
   fi
   
-  # Install system dependencies (always needed for kubectl)
+  # Install system dependencies
   echo "=== Installing system dependencies ==="
   if ! command -v kubectl &> /dev/null; then
     apt-get update && apt-get install -y socat curl git

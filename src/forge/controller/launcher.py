@@ -174,6 +174,14 @@ class SkyPilotLauncher(BaseLauncher):
 
         cloud = skypilot_args.get("cloud")
         infra = skypilot_args.get("infra")  # e.g., "kubernetes/sky-dev"
+        
+        # Auto-detect infra from SKYPILOT_CLUSTER_INFO if not specified
+        # This env var is set by SkyPilot when running inside a cluster
+        if not infra:
+            infra = self._detect_infra_from_env()
+            if infra:
+                logger.info(f"Auto-detected infra from SKYPILOT_CLUSTER_INFO: {infra}")
+        
         image_id = skypilot_args.get("image_id")
         idle_minutes_to_autostop = skypilot_args.get("idle_minutes_to_autostop", 30)
         model_name = skypilot_args.get("model_name")
@@ -229,6 +237,45 @@ class SkyPilotLauncher(BaseLauncher):
 
         logger.info("SkyPilotLauncher initialization complete.")
         return job, job_state
+
+    def _detect_infra_from_env(self) -> str | None:
+        """Auto-detect infrastructure from SKYPILOT_CLUSTER_INFO environment variable.
+        
+        SkyPilot sets this env var when running inside a cluster, containing JSON like:
+        {"cluster_name": "my-cluster", "cloud": "kubernetes", "region": "sky-dev", ...}
+        
+        Returns:
+            Infra string like "kubernetes/sky-dev" or "aws/us-west-2", or None if not available.
+        """
+        import json
+        import os
+        
+        cluster_info_str = os.environ.get("SKYPILOT_CLUSTER_INFO")
+        if not cluster_info_str:
+            logger.debug("SKYPILOT_CLUSTER_INFO not set, cannot auto-detect infra")
+            return None
+        
+        try:
+            cluster_info = json.loads(cluster_info_str)
+            cloud = cluster_info.get("cloud", "").lower()
+            region = cluster_info.get("region", "")
+            
+            if cloud and region:
+                infra = f"{cloud}/{region}"
+                logger.info(f"Detected infra from SKYPILOT_CLUSTER_INFO: {infra}")
+                return infra
+            elif cloud:
+                logger.info(f"Detected cloud from SKYPILOT_CLUSTER_INFO: {cloud}")
+                return cloud
+            else:
+                logger.warning(f"SKYPILOT_CLUSTER_INFO missing cloud/region: {cluster_info}")
+                return None
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse SKYPILOT_CLUSTER_INFO: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Error detecting infra from SKYPILOT_CLUSTER_INFO: {e}")
+            return None
 
     async def remote_setup(self, procs: ProcMesh) -> None:
         return

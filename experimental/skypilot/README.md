@@ -1,6 +1,6 @@
-# Running TorchForge on Kubernetes and Cloud VMs via SkyPilot
+# Running TorchForge on Kubernetes via SkyPilot
 
-This directory contains examples for running TorchForge GRPO training on **Kubernetes and cloud VMs** via [SkyPilot](https://github.com/skypilot-org/skypilot).
+This directory contains examples for running TorchForge GRPO training on **Kubernetes** via [SkyPilot](https://github.com/skypilot-org/skypilot).
 
 In a nutshell:
 ```bash
